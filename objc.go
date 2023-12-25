@@ -35,6 +35,9 @@ func (f *File) rebasePtr(ptr uint64) uint64 {
 	if f.Flags.DylibInCache() {
 		return ptr
 	} else {
+		if ptr > f.GetBaseAddress() {
+			return ptr
+		}
 		return ptr + f.GetBaseAddress()
 	}
 }

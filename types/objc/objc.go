@@ -337,6 +337,8 @@ type Method struct {
 	NameLocationVMAddr uint64
 	Name               string
 	Types              string
+
+	ExtendTypes string
 }
 
 // NumberOfArguments returns the number of method arguments

@@ -50,6 +50,8 @@ var cpuStrings = []IntName{
 
 func (i CPU) String() string   { return StringName(uint32(i), cpuStrings, false) }
 func (i CPU) GoString() string { return StringName(uint32(i), cpuStrings, true) }
+func (i CPU) Is64() bool       { return uint32(i)&cpuArch64 != 0 }
+func (i CPU) IsArm() bool      { return i&CPUArm == CPUArm }
 
 type CPUSubtype uint32
 

@@ -37,6 +37,7 @@ type File struct {
 	exp         []trie.TrieExport
 	exptrieData []byte
 	binds       types.Binds
+	bindsMap    *sync.Map
 	objc        map[uint64]any
 	swift       map[uint64]any
 	ledata      *bytes.Buffer // tmp storage of linkedit data
@@ -2355,7 +2356,6 @@ func (f *File) GetBindInfo() (types.Binds, error) {
 	} else {
 		return nil, ErrMachODyldInfoNotFound
 	}
-
 	return f.binds, nil
 }
 

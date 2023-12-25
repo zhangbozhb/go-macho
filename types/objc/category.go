@@ -25,6 +25,8 @@ type Category struct {
 	InstanceMethods []Method
 	Properties      []Property
 	CategoryT
+
+	ExtClassName string
 }
 
 func (c *Category) dump(verbose, addrs bool) string {

@@ -158,18 +158,18 @@ func getPropertyType(attrs string) (typ string) {
 		for i := len(parts) - 1; i >= 0; i-- {
 			sub := parts[i]
 			switch string(sub[0]) {
-			case propertyReadOnly:
-			case propertyBycopy:
-			case propertyByref:
-			case propertyDynamic:
-			case propertyGetter:
-			case propertySetter:
-			case propertyIVar:
-			case propertyWeak:
-			case propertyStrong:
-			case propertyAtomic:
-			case propertyNonAtomic:
-			case propertyType:
+			case propertyReadOnly,
+				propertyBycopy,
+				propertyByref,
+				propertyDynamic,
+				propertyGetter,
+				propertySetter,
+				propertyIVar,
+				propertyWeak,
+				propertyStrong,
+				propertyAtomic,
+				propertyNonAtomic,
+				propertyType:
 				typParts = append([]string{strings.TrimPrefix(sub, propertyType)}, typParts...)
 				attr = strings.Join(typParts, ",")
 			default:

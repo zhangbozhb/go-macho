@@ -126,6 +126,8 @@ type Class struct {
 	IsSwiftLegacy         bool
 	IsSwiftStable         bool
 	ReadOnlyData          ClassRO64
+
+	ExtIsSimple bool
 }
 
 func (c *Class) dump(verbose, addrs bool) string {
