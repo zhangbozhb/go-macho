@@ -48,6 +48,8 @@ type File struct {
 	sr     types.MachoReader
 	cr     types.MachoReader
 	closer io.Closer
+
+	reloc map[uint64]*Symbol
 }
 
 /*

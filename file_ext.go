@@ -32,3 +32,7 @@ func (f *File) ExtGetFileData() ([]byte, error) {
 	f.cr.Seek(0, io.SeekStart)
 	return io.ReadAll(f.cr)
 }
+
+func (f *File) ExtGetSymbolAddr(index uint32) uint64 {
+	return uint64(f.symbolSize()) * uint64(index) + uint64(f.Symtab.Symoff)
+}

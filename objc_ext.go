@@ -274,6 +274,25 @@ func (f *File) ExtSectionReaderAsUString(sec *types.Section, handle func(name st
 	return nil
 }
 
+func (f *File) ExtGetRelocSymbolAddr(addr uint64) *Symbol {
+	if f.reloc == nil {
+		relocInfo := make(map[uint64]*Symbol)
+		for _, section := range f.Sections {
+			syms := f.Symtab.Syms
+			count := len(syms)
+			for _, reloc := range section.Relocs {
+				if int(reloc.Value) < count {
+					symbol := f.Symtab.Syms[reloc.Value]
+					relocAddr := section.Addr + uint64(reloc.Addr)
+					relocInfo[relocAddr] = &symbol
+				}
+			}
+		}
+		f.reloc = relocInfo
+	}
+	return f.reloc[addr]
+}
+
 // ExtGetStrings
 //
 //	@Description: 获取字符串列表
@@ -500,7 +519,28 @@ func (f *File) ExtGetLazySymbols(matchers ...SectionMatcher) []*AddrData {
 		return sec.Name == SectionDataLazySymbolPtr
 	}), f.pointerSize())
 }
-
+func (f *File) ExtGetSymbols(matcher func(sym *Symbol)bool) []*AddrData {
+	symTab := f.Symtab
+	symSize := f.symbolSize()
+	retList := make([]*AddrData, 0)
+	for i  := range symTab.Syms {
+		sym := symTab.Syms[i]
+		if matcher != nil && !matcher(&sym) {
+			continue
+		}
+		symAddress := uint64(i * symSize) + uint64(symTab.Symoff)
+		retList = append(retList, &AddrData{
+			Address: symAddress,
+			Data:    &sym,
+		})
+	}
+	return retList
+}
+func (f *File) ExtGetExtSymbols() []*AddrData {
+	return  f.ExtGetSymbols(func(sym *Symbol) bool {
+		return sym.Type.IsExternalSym() && sym.Sect == 0
+	})
+}
 func (f *File) ExtGetGotSymbols(matchers ...SectionMatcher) []*AddrData {
 	return f.ExtGetIndirectSymbols(NewSectionMatcher(matchers, func(sec *types.Section) bool {
 		return sec.Name == SectionDataGot
@@ -567,6 +607,10 @@ func (f *File) ExtGetBindName(pointer uint64) (string, error) {
 	if d, ok := f.bindsMap.Load(pointer); ok {
 		name = d.(*types.Bind).Name
 	} else {
+		symbol := f.ExtGetRelocSymbolAddr(pointer)
+		if symbol != nil {
+			return symbol.Name, nil
+		}
 		err = fmt.Errorf("pointer %#x is not a bind", pointer)
 	}
 	return name, err
