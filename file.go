@@ -1353,7 +1353,7 @@ func cstring(b []byte) string {
 func readString(r io.Reader) (string, error) {
 	var b byte
 	var str string
-
+	count := 0
 	for {
 		err := binary.Read(r, binary.BigEndian, &b)
 
@@ -1366,6 +1366,10 @@ func readString(r io.Reader) (string, error) {
 		}
 
 		str += string(b)
+		count += 1
+		if count > (1 << 16) {
+			return "", fmt.Errorf("bad string. too many bytes")
+		}
 	}
 }
 

@@ -519,16 +519,16 @@ func (f *File) ExtGetLazySymbols(matchers ...SectionMatcher) []*AddrData {
 		return sec.Name == SectionDataLazySymbolPtr
 	}), f.pointerSize())
 }
-func (f *File) ExtGetSymbols(matcher func(sym *Symbol)bool) []*AddrData {
+func (f *File) ExtGetSymbols(matcher func(sym *Symbol) bool) []*AddrData {
 	symTab := f.Symtab
 	symSize := f.symbolSize()
 	retList := make([]*AddrData, 0)
-	for i  := range symTab.Syms {
+	for i := range symTab.Syms {
 		sym := symTab.Syms[i]
 		if matcher != nil && !matcher(&sym) {
 			continue
 		}
-		symAddress := uint64(i * symSize) + uint64(symTab.Symoff)
+		symAddress := uint64(i*symSize) + uint64(symTab.Symoff)
 		retList = append(retList, &AddrData{
 			Address: symAddress,
 			Data:    &sym,
@@ -537,7 +537,7 @@ func (f *File) ExtGetSymbols(matcher func(sym *Symbol)bool) []*AddrData {
 	return retList
 }
 func (f *File) ExtGetExtSymbols() []*AddrData {
-	return  f.ExtGetSymbols(func(sym *Symbol) bool {
+	return f.ExtGetSymbols(func(sym *Symbol) bool {
 		return sym.Type.IsExternalSym() && sym.Sect == 0
 	})
 }
@@ -1364,7 +1364,7 @@ func (f *File) ExtGetBlocks() ([]*types.ObjcBlock, error) {
 				binary.Read(dataReader, f.ByteOrder, &bd)
 				if block.Flags.HasSignature() {
 					sigAddr := bd.GetSignature(block.Flags)
-					if sigAddr > 0 {
+					if sigAddr > 0 && sigAddr < (1<<36) { // 强制与 sigAddr 进行比较
 						dataReader.SeekToAddr(sigAddr)
 						if s, err := readString(dataReader); err == nil {
 							signature = s
