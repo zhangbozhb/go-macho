@@ -1349,7 +1349,9 @@ func (f *File) ExtGetBlocks() ([]*types.ObjcBlock, error) {
 			continue
 		}
 		vmaddr := bind.Start + bind.Offset
-		dataReader.SeekToAddr(vmaddr)
+		if err := dataReader.SeekToAddr(vmaddr); err != nil {
+			continue
+		}
 		if f.is64bit() {
 			block := types.ObjcBlock64{}
 			err := binary.Read(dataReader, f.ByteOrder, &block)
@@ -1360,12 +1362,18 @@ func (f *File) ExtGetBlocks() ([]*types.ObjcBlock, error) {
 			signature := ""
 			if block.Desc != 0 {
 				bd := types.ObjcBlockDesc{}
-				dataReader.SeekToAddr(block.Desc)
-				binary.Read(dataReader, f.ByteOrder, &bd)
+				if err := dataReader.SeekToAddr(block.Desc); err != nil {
+					continue
+				}
+				if err := binary.Read(dataReader, f.ByteOrder, &bd); err != nil {
+					continue
+				}
 				if block.Flags.HasSignature() {
 					sigAddr := bd.GetSignature(block.Flags)
 					if sigAddr > 0 && sigAddr < (1<<36) { // 强制与 sigAddr 进行比较
-						dataReader.SeekToAddr(sigAddr)
+						if err := dataReader.SeekToAddr(sigAddr); err != nil {
+							continue
+						}
 						if s, err := readString(dataReader); err == nil {
 							signature = s
 						}
