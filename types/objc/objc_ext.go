@@ -66,3 +66,13 @@ func (c *Category) NormalizeData() {
 	c.InstanceMethods = UniqueAndSortMethods(c.InstanceMethods, true)
 	c.ClassMethods = UniqueAndSortMethods(c.ClassMethods, true)
 }
+
+func (c *Category) GetClassName() string {
+	clsName := c.ExtClassName
+	if c.Class != nil {
+		if c.Class.Name != "" {
+			clsName = c.Class.Name
+		}
+	}
+	return clsName
+}

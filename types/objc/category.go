@@ -64,6 +64,7 @@ func (c *Category) dump(verbose, addrs bool) string {
 	} else {
 		cat = fmt.Sprintf("@interface %s(%s)%s", className, c.Name, protos)
 	}
+	cat += "\n"
 
 	if len(c.ClassMethods) > 0 {
 		s := bytes.NewBufferString("/* class methods */\n")
@@ -82,14 +83,12 @@ func (c *Category) dump(verbose, addrs bool) string {
 			}
 		}
 		cMethods = s.String()
+		if cMethods != "" {
+			cMethods += "\n"
+		}
 	}
 	if len(c.InstanceMethods) > 0 {
-		var s *bytes.Buffer
-		if len(c.ClassMethods) > 0 {
-			s = bytes.NewBufferString("\n/* instance methods */\n")
-		} else {
-			s = bytes.NewBufferString("/* instance methods */\n")
-		}
+		s := bytes.NewBufferString("/* instance methods */\n")
 		for _, meth := range c.InstanceMethods {
 			if !addrs && strings.HasPrefix(meth.Name, ".cxx_") {
 				continue
@@ -105,13 +104,20 @@ func (c *Category) dump(verbose, addrs bool) string {
 			}
 		}
 		iMethods = s.String()
+		if iMethods != "" {
+			iMethods += "\n"
+		}
 	}
 
 	return fmt.Sprintf(
-		"%s\n%s%s@end\n",
+		"%s\n"+
+			"%s"+
+			"%s"+
+			"@end\n",
 		cat,
 		cMethods,
-		iMethods)
+		iMethods,
+	)
 }
 
 func (c *Category) String() string {

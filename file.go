@@ -15,9 +15,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/blacktop/go-dwarf"
 
+	"github.com/blacktop/go-macho/internal/saferio"
 	"github.com/blacktop/go-macho/pkg/codesign"
 	"github.com/blacktop/go-macho/pkg/fixupchains"
 	"github.com/blacktop/go-macho/pkg/trie"
@@ -37,7 +39,6 @@ type File struct {
 	exp         []trie.TrieExport
 	exptrieData []byte
 	binds       types.Binds
-	bindsMap    *sync.Map
 	objc        map[uint64]any
 	swift       map[uint64]any
 	ledata      *bytes.Buffer // tmp storage of linkedit data
@@ -49,15 +50,18 @@ type File struct {
 	cr     types.MachoReader
 	closer io.Closer
 
-	reloc map[uint64]*Symbol
+	bindsMap *sync.Map
+	relocMap map[uint64]*Symbol
 }
 
 /*
  * Mach-O reader
  */
 
+var ErrMachOArchNotSupported = errors.New("MachO arch not supported")
 var ErrMachOSectionNotFound = errors.New("MachO missing required section")
 var ErrMachODyldInfoNotFound = errors.New("LC_DYLD_INFO(_ONLY) not found")
+var ErrMachONoBindInfo = errors.New("MachO does not contain bind information (fixups)")
 
 // FormatError is returned by some operations if the data does
 // not have the correct format for an object file.
@@ -134,6 +138,14 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 	f.objc = make(map[uint64]any)
 	f.swift = make(map[uint64]any)
 
+	f.vma = &types.VMAddrConverter{
+		Converter:    f.convertToVMAddr,
+		VMAddr2Offet: f.getOffset,
+		Offet2VMAddr: f.getVMAddress,
+	}
+	f.sr = types.NewCustomSectionReader(r, f.vma, 0, 1<<63-1)
+	f.cr = f.sr
+
 	if config != nil {
 		if config[0].SectionReader != nil {
 			f.sr = config[0].SectionReader
@@ -143,18 +155,12 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 		if config[0].CacheReader != nil {
 			f.cr = config[0].CacheReader
 		}
-		f.vma = &config[0].VMAddrConverter
+		if config[0].VMAddrConverter.Converter != nil {
+			f.vma = &config[0].VMAddrConverter
+		}
 		loadIncluding = config[0].LoadIncluding
 		loadExcluding = config[0].LoadExcluding
 		f.sharedCacheRelativeSelectorBaseVMAddress = config[0].RelativeSelectorBase
-	} else {
-		f.vma = &types.VMAddrConverter{
-			Converter:    f.convertToVMAddr,
-			VMAddr2Offet: f.getOffset,
-			Offet2VMAddr: f.getVMAddress,
-		}
-		f.sr = types.NewCustomSectionReader(r, f.vma, 0, 1<<63-1)
-		f.cr = f.sr
 	}
 
 	// Read and decode Mach magic to determine byte order, size.
@@ -186,11 +192,15 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 	if f.Magic == types.Magic64 {
 		offset = types.FileHeaderSize64
 	}
-	dat := make([]byte, f.SizeCommands)
-	if _, err := r.ReadAt(dat, offset); err != nil {
-		return nil, fmt.Errorf("failed to parse command dat: %v", err)
+	dat, err := saferio.ReadDataAt(r, uint64(f.SizeCommands), offset)
+	if err != nil {
+		return nil, err
 	}
-	f.Loads = []Load{}
+	c := saferio.SliceCap[Load](uint64(f.NCommands))
+	if c < 0 {
+		return nil, &FormatError{offset, "too many load commands", nil}
+	}
+	f.Loads = make([]Load, 0, c)
 	bo := f.ByteOrder
 	for i := uint32(0); i < f.NCommands; i++ {
 		// Each load command begins with uint32 command and length.
@@ -315,13 +325,19 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			if err := binary.Read(b, bo, &hdr); err != nil {
 				return nil, fmt.Errorf("failed to read LC_SYMTAB: %v", err)
 			}
-			symdat := make([]byte, int(hdr.Nsyms)*f.symbolSize())
-			if _, err := f.cr.ReadAt(symdat, int64(hdr.Symoff)); err != nil {
-				return nil, fmt.Errorf("failed to read data at Symoff=%#x; %v", int64(hdr.Symoff), err)
-			}
-			strtab := make([]byte, hdr.Strsize)
-			if _, err := f.cr.ReadAt(strtab, int64(hdr.Stroff)); err != nil {
+			strtab, err := saferio.ReadDataAt(f.cr, uint64(hdr.Strsize), int64(hdr.Stroff))
+			if err != nil {
 				return nil, fmt.Errorf("failed to read data at Stroff=%#x; %v", int64(hdr.Stroff), err)
+			}
+			var symsz int
+			if f.Magic == types.Magic64 {
+				symsz = 16
+			} else {
+				symsz = 12
+			}
+			symdat, err := saferio.ReadDataAt(f.cr, uint64(hdr.Nsyms)*uint64(symsz), int64(hdr.Symoff))
+			if err != nil {
+				return nil, fmt.Errorf("failed to read data at Symoff=%#x; %v", int64(hdr.Symoff), err)
 			}
 			st, err := f.parseSymtab(symdat, strtab, cmddat, &hdr, offset)
 			if err != nil {
@@ -356,6 +372,10 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			l.LoadBytes = cmddat
 			l.LoadCmd = cmd
 			l.Len = siz
+			l.bo = bo
+			if f.isArm() || f.isArm64() || f.isArm64e() {
+				l.IsArm = true
+			}
 			for {
 				var thread types.ThreadState
 				err := binary.Read(b, bo, &thread.Flavor)
@@ -386,6 +406,9 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			l.LoadCmd = cmd
 			l.Len = siz
 			l.bo = bo
+			if f.isArm() || f.isArm64() || f.isArm64e() {
+				l.IsArm = true
+			}
 			for {
 				var thread types.ThreadState
 				err := binary.Read(b, bo, &thread.Flavor)
@@ -497,18 +520,20 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			if err := binary.Read(b, bo, &hdr); err != nil {
 				return nil, fmt.Errorf("failed to read LC_DYSYMTAB: %v", err)
 			}
-			if f.Symtab != nil && hdr.Iundefsym > uint32(len(f.Symtab.Syms)) {
+			if f.Symtab == nil {
+				return nil, &FormatError{offset, "dynamic symbol table seen before any ordinary symbol table", nil}
+			} else if hdr.Iundefsym > uint32(len(f.Symtab.Syms)) {
 				return nil, &FormatError{offset, fmt.Sprintf(
 					"undefined symbols index in dynamic symbol table command is greater than symbol table length (%d > %d)",
 					hdr.Iundefsym, len(f.Symtab.Syms)), nil}
-			} else if f.Symtab != nil && hdr.Iundefsym+hdr.Nundefsym > uint32(len(f.Symtab.Syms)) {
+			} else if hdr.Iundefsym+hdr.Nundefsym > uint32(len(f.Symtab.Syms)) {
 				return nil, &FormatError{offset, fmt.Sprintf(
 					"number of undefined symbols after index in dynamic symbol table command is greater than symbol table length (%d > %d)",
 					hdr.Iundefsym+hdr.Nundefsym, len(f.Symtab.Syms)), nil}
 			}
-			dat := make([]byte, hdr.Nindirectsyms*4)
-			if _, err := f.cr.ReadAt(dat, int64(hdr.Indirectsymoff)); err != nil {
-				return nil, fmt.Errorf("failed to read data at Indirectsymoff=%#x; %v", int64(hdr.Indirectsymoff), err)
+			dat, err := saferio.ReadDataAt(f.cr, uint64(hdr.Nindirectsyms)*4, int64(hdr.Indirectsymoff))
+			if err != nil {
+				return nil, fmt.Errorf("failed to read data at Indirectsymoff @ %#x: %w", int64(hdr.Indirectsymoff), err)
 			}
 			x := make([]uint32, hdr.Nindirectsyms)
 			if err := binary.Read(bytes.NewReader(dat), bo, x); err != nil {
@@ -1147,6 +1172,11 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			l.DataOwner = n.DataOwner
 			l.Offset = n.Offset
 			l.Size = n.Size
+			l.bo = bo
+			l.Data = make([]byte, l.Size)
+			if _, err := f.cr.ReadAt(l.Data, int64(l.Offset)); err != nil {
+				return nil, fmt.Errorf("failed to read Note data at offset=%#x; %v", int64(l.Offset), err)
+			}
 			f.Loads = append(f.Loads, l)
 		case types.LC_BUILD_VERSION:
 			var build types.BuildVersionCmd
@@ -1232,8 +1262,53 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			l.Offset = led.Offset
 			l.Size = led.Size
 			f.Loads = append(f.Loads, l)
+		case types.LC_SEP_CACHE_SLIDE:
+			var led types.LinkEditDataCmd
+			b := bytes.NewReader(cmddat)
+			if err := binary.Read(b, bo, &led); err != nil {
+				return nil, fmt.Errorf("failed to read LC_SEP_CACHE_SLIDE: %v", err)
+			}
+			l := new(SepCacheSlide)
+			l.LoadBytes = cmddat
+			l.LoadCmd = cmd
+			l.Len = siz
+			l.Offset = led.Offset
+			l.Size = led.Size
+			f.Loads = append(f.Loads, l)
+		case types.LC_SEP_UNKNOWN_2:
+			var led types.SepUnknown2Cmd
+			b := bytes.NewReader(cmddat)
+			if err := binary.Read(b, bo, &led); err != nil {
+				return nil, fmt.Errorf("failed to read LC_SEP_UNKNOWN_2: %v", err)
+			}
+			l := new(SepUnknown2)
+			l.LoadBytes = cmddat
+			l.LoadCmd = cmd
+			l.Len = siz
+			l.Offset = led.Offset
+			l.Size = led.Size
+			f.Loads = append(f.Loads, l)
+		case types.LC_SEP_UNKNOWN_3:
+			var led types.SepUnknown3Cmd
+			b := bytes.NewReader(cmddat)
+			if err := binary.Read(b, bo, &led); err != nil {
+				return nil, fmt.Errorf("failed to read LC_SEP_SYMSEG: %v", err)
+			}
+			l := new(SepUnknown3)
+			l.LoadBytes = cmddat
+			l.LoadCmd = cmd
+			l.Len = siz
+			l.Offset = led.Offset
+			l.Size = led.Size
+			f.Loads = append(f.Loads, l)
 		}
 		if s != nil {
+			if int64(s.Offset) < 0 {
+				return nil, &FormatError{offset, "invalid section offset", s.Offset}
+			}
+			if int64(s.Filesz) < 0 {
+				return nil, &FormatError{offset, "invalid section file size", s.Filesz}
+			}
 			// s.sr = io.NewSectionReader(r, int64(s.Offset), int64(s.Filesz))
 			s.ReaderAt = f.sr
 		}
@@ -1243,9 +1318,13 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 
 func (f *File) parseSymtab(symdat, strtab, cmddat []byte, hdr *types.SymtabCmd, offset int64) (*Symtab, error) {
 	bo := f.ByteOrder
-	symtab := make([]Symbol, hdr.Nsyms)
+	c := saferio.SliceCap[Symbol](uint64(hdr.Nsyms))
+	if c < 0 {
+		return nil, &FormatError{offset, "too many symbols", nil}
+	}
+	symtab := make([]Symbol, 0, c)
 	b := bytes.NewReader(symdat)
-	for i := range symtab {
+	for i := 0; i < int(hdr.Nsyms); i++ {
 		var n types.Nlist64
 		if f.Magic == types.Magic64 {
 			if err := binary.Read(b, bo, &n); err != nil {
@@ -1262,20 +1341,21 @@ func (f *File) parseSymtab(symdat, strtab, cmddat []byte, hdr *types.SymtabCmd, 
 			n.Desc = n32.Desc
 			n.Value = uint64(n32.Value)
 		}
-		sym := &symtab[i]
-		if n.Name >= uint32(len(strtab)) {
-			return nil, &FormatError{offset, "invalid name in symbol table", n.Name}
+		var name string
+		if n.Name < uint32(len(strtab)) {
+			// We add "_" to Go symbols. Strip it here. See issue 33808.
+			name = cstring(strtab[n.Name:])
+			if strings.Contains(name, ".") && name[0] == '_' {
+				name = name[1:]
+			}
 		}
-		// We add "_" to Go symbols. Strip it here. See issue 33808.
-		name := cstring(strtab[n.Name:])
-		if strings.Contains(name, ".") && name[0] == '_' {
-			name = name[1:]
-		}
-		sym.Name = name
-		sym.Type = n.Type
-		sym.Sect = n.Sect
-		sym.Desc = n.Desc
-		sym.Value = n.Value
+		symtab = append(symtab, Symbol{
+			Name:  name,
+			Type:  n.Type,
+			Sect:  n.Sect,
+			Desc:  n.Desc,
+			Value: n.Value,
+		})
 	}
 	st := new(Symtab)
 	st.LoadBytes = LoadBytes(cmddat)
@@ -1292,9 +1372,9 @@ func (f *File) pushSection(sh *types.Section, r io.ReaderAt) error {
 	f.Sections = append(f.Sections, sh)
 
 	if sh.Nreloc > 0 {
-		reldat := make([]byte, int(sh.Nreloc)*8)
-		if _, err := r.ReadAt(reldat, int64(sh.Reloff)); err != nil {
-			return fmt.Errorf("failed to read data at Reloff=%#x; %v", int64(sh.Reloff), err)
+		reldat, err := saferio.ReadDataAt(r, uint64(sh.Nreloc)*8, int64(sh.Reloff))
+		if err != nil {
+			return fmt.Errorf("failed to read data at Reloff @ %#x: %w", int64(sh.Reloff), err)
 		}
 		b := bytes.NewReader(reldat)
 
@@ -1306,7 +1386,7 @@ func (f *File) pushSection(sh *types.Section, r io.ReaderAt) error {
 
 			var ri types.RelocInfo
 			if err := binary.Read(b, bo, &ri); err != nil {
-				return fmt.Errorf("failed to read relocInfo; %v", err)
+				return fmt.Errorf("failed to read types.RelocInfo: %w", err)
 			}
 
 			if ri.Addr&(1<<31) != 0 { // scattered
@@ -1374,6 +1454,11 @@ func readString(r io.Reader) (string, error) {
 }
 
 func (f *File) is64bit() bool { return f.FileHeader.Magic == types.Magic64 }
+func (f *File) isArm() bool   { return f.CPU == types.CPUArm }
+func (f *File) isArm64() bool { return f.CPU == types.CPUArm64 || f.CPU == types.CPUArm6432 }
+func (f *File) isArm64e() bool {
+	return f.isArm64() && (f.SubCPU&types.CpuSubtypeMask) == types.CPUSubtypeArm64E
+}
 
 func (f *File) pointerSize() uint64 {
 	if f.is64bit() {
@@ -1481,7 +1566,6 @@ func (f *File) convertToVMAddr(value uint64) uint64 {
 	if value == 0 {
 		return 0
 	}
-
 	if f.HasFixups() {
 		if dcf, err := f.DyldChainedFixups(); err == nil {
 			if target, ok := dcf.IsRebase(value, f.GetBaseAddress()); ok {
@@ -1497,6 +1581,7 @@ func (f *File) convertToVMAddr(value uint64) uint64 {
 				return value
 			}
 		}
+	} else if f.isArm64e() {
 		// TODO: fix this dumb hack for SUPPORT_OLD_ARM64E_FORMAT
 		dcf := fixupchains.DyldChainedFixups{
 			PointerFormat: fixupchains.DYLD_CHAINED_PTR_ARM64E,
@@ -1513,7 +1598,6 @@ func (f *File) convertToVMAddr(value uint64) uint64 {
 			}
 		}
 	}
-
 	return value
 }
 
@@ -1541,14 +1625,14 @@ func (f *File) GetBindName(pointer uint64) (string, error) {
 				return "", fmt.Errorf("failed to parse LC_DYLD_INFO_ONLY bind info: %v", err)
 			}
 			for _, bind := range binds {
-				if bind.Value == pointer {
+				if (bind.Start + bind.SegOffset) == pointer {
 					return bind.Name, nil
 				}
 			}
 			return "", fmt.Errorf("pointer %#x is not a bind", pointer)
 		}
 	}
-	return "", fmt.Errorf("macho does not contain fixups")
+	return "", ErrMachONoBindInfo
 }
 
 // GetCString returns a c-string at a given virtual address in the MachO
@@ -1567,6 +1651,52 @@ func (f *File) GetCString(addr uint64) (string, error) {
 	}
 
 	return "", fmt.Errorf("string not found at address %#x", addr)
+}
+
+func (f *File) GetCStrings() (map[string]map[string]uint64, error) {
+	strs := make(map[string]map[string]uint64)
+
+	for _, sec := range f.Sections {
+		if sec.Flags.IsCstringLiterals() || sec.Name == "__os_log" {
+			f.cr.SeekToAddr(sec.Addr)
+			dat := make([]byte, sec.Size)
+			if _, err := f.cr.Read(dat); err != nil {
+				return nil, fmt.Errorf("failed to read cstring data in %s.%s: %v", sec.Seg, sec.Name, err)
+			}
+
+			section := fmt.Sprintf("%s.%s", sec.Seg, sec.Name)
+			strs[section] = make(map[string]uint64)
+
+			csr := bytes.NewBuffer(dat)
+
+			for {
+				pos := sec.Addr + uint64(csr.Cap()-csr.Len())
+
+				s, err := csr.ReadString('\x00')
+
+				if err == io.EOF {
+					break
+				}
+
+				if err != nil {
+					return nil, fmt.Errorf("failed to read string: %v", err)
+				}
+
+				s = strings.Trim(s, "\x00")
+
+				if len(s) > 0 {
+					for _, r := range s {
+						if r > unicode.MaxASCII || !unicode.IsPrint(r) {
+							continue // skip non-ascii strings
+						}
+					}
+					strs[section][s] = pos
+				}
+			}
+		}
+	}
+
+	return strs, nil
 }
 
 // GetCStringAtOffset returns a c-string at a given offset into the MachO
@@ -1664,6 +1794,16 @@ func (f *File) Section(segment, section string) *types.Section {
 
 // FindSegmentForVMAddr returns the segment containing a given virtual memory ddress.
 func (f *File) FindSegmentForVMAddr(vmAddr uint64) *Segment {
+	if f.FileTOC.FileHeader.Type == types.MH_FILESET {
+		for _, fs := range f.FileSets() {
+			if mfe, err := f.GetFileSetFileByName(fs.EntryID); err == nil {
+				if seg := mfe.FindSegmentForVMAddr(vmAddr); seg != nil {
+					seg.Name = fmt.Sprintf("%s.%s", fs.EntryID, seg.Name)
+					return seg
+				}
+			}
+		}
+	}
 	for _, seg := range f.Segments() {
 		if seg.Addr <= vmAddr && vmAddr < seg.Addr+seg.Memsz {
 			return seg
@@ -1674,6 +1814,16 @@ func (f *File) FindSegmentForVMAddr(vmAddr uint64) *Segment {
 
 // FindSectionForVMAddr returns the section containing a given virtual memory ddress.
 func (f *File) FindSectionForVMAddr(vmAddr uint64) *types.Section {
+	if f.FileTOC.FileHeader.Type == types.MH_FILESET {
+		for _, fs := range f.FileSets() {
+			if mfe, err := f.GetFileSetFileByName(fs.EntryID); err == nil {
+				if sec := mfe.FindSectionForVMAddr(vmAddr); sec != nil {
+					sec.Name = fmt.Sprintf("%s.%s", fs.EntryID, sec.Name)
+					return sec
+				}
+			}
+		}
+	}
 	for _, sec := range f.Sections {
 		if sec.Addr <= vmAddr && vmAddr < sec.Addr+sec.Size {
 			return sec
@@ -1732,11 +1882,29 @@ func (f *File) SourceVersion() *SourceVersion {
 	return nil
 }
 
-// BuildVersion returns the build version load command, or nil if no build version exists.
-func (f *File) BuildVersion() *BuildVersion {
+// BuildVersions returns the build version load commands as an array.
+func (f *File) BuildVersions() []*BuildVersion {
+	var builds []*BuildVersion
 	for _, l := range f.Loads {
 		if s, ok := l.(*BuildVersion); ok {
-			return s
+			builds = append(builds, s)
+		}
+	}
+	return builds
+}
+
+// VersionMin returns the minimum-version load command, or nil if no minimum-version exists.
+func (f *File) VersionMin() *VersionMin {
+	for _, l := range f.Loads {
+		switch s := l.(type) {
+		case *VersionMinMacOSX:
+			return &s.VersionMin
+		case *VersionMinTvOS:
+			return &s.VersionMin
+		case *VersionMinWatchOS:
+			return &s.VersionMin
+		case *VersionMiniPhoneOS:
+			return &s.VersionMin
 		}
 	}
 	return nil
@@ -1794,6 +1962,56 @@ func (f *File) FunctionStarts() *FunctionStarts {
 	return nil
 }
 
+func (f *File) GenerateFunctionStarts() ([]types.Function, error) {
+	if len(f.functions) > 0 {
+		return f.functions, nil
+	}
+
+	if !f.isArm64e() {
+		return nil, ErrMachOArchNotSupported
+	}
+
+	var funcs []types.Function
+
+	text := f.Section("__TEXT", "__text")
+	if text == nil {
+		text = f.Section("__TEXT_EXEC", "__text")
+		if text == nil {
+			return nil, ErrMachOSectionNotFound
+		}
+	}
+	data, err := text.Data()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read __text section data: %v", err)
+	}
+
+	instructions := make([]uint32, len(data)/binary.Size(uint32(0)))
+	if err := binary.Read(bytes.NewReader(data), f.ByteOrder, &instructions); err != nil {
+		return nil, fmt.Errorf("failed to read __text section data: %v", err)
+	}
+
+	// find function starts by looking for the instruction 0xe320f000
+	for idx, instr := range instructions {
+		if instr == 0xd503237f {
+			funcs = append(funcs, types.Function{
+				StartAddr: text.Addr + uint64(idx*4),
+			})
+		}
+	}
+	if len(funcs) == 0 {
+		return nil, fmt.Errorf("failed to find any function starts by searching for 'pacibsp' prologues")
+	}
+	// set end addresses
+	for i := 0; i < len(funcs)-1; i++ {
+		funcs[i].EndAddr = funcs[i+1].StartAddr
+	}
+	funcs[len(funcs)-1].EndAddr = Align(text.Addr+text.Size, uint64(text.Align))
+
+	f.functions = funcs
+
+	return funcs, nil
+}
+
 // GetFunctions returns the function array, or nil if none exists.
 func (f *File) GetFunctions(data ...byte) []types.Function {
 
@@ -1805,6 +2023,9 @@ func (f *File) GetFunctions(data ...byte) []types.Function {
 
 	fs := f.FunctionStarts()
 	if fs == nil {
+		if fs, err := f.GenerateFunctionStarts(); err == nil {
+			return fs
+		}
 		return nil
 	}
 
@@ -1882,6 +2103,9 @@ func (f *File) GetFunctionsForRange(start, end uint64) ([]types.Function, error)
 }
 
 func (f *File) GetFunctionData(fn types.Function) ([]byte, error) {
+	if fn.EndAddr <= fn.StartAddr {
+		return nil, fmt.Errorf("invalid function range %#x - %#x", fn.StartAddr, fn.EndAddr)
+	}
 	data := make([]byte, fn.EndAddr-fn.StartAddr)
 	if _, err := f.cr.ReadAtAddr(data, fn.StartAddr); err != nil {
 		return nil, fmt.Errorf("failed to read data at address %#x: %v", fn.StartAddr, err)
@@ -2133,7 +2357,7 @@ type BitstreamWrapperHeader struct {
 func (f *File) GetEmbeddedLLVMBitcode() (*xar.Reader, error) {
 	llvmBundle := f.Section("__LLVM", "__bundle")
 	if llvmBundle == nil {
-		return nil, fmt.Errorf("no %s.%s section", llvmBundle.Seg, llvmBundle.Name)
+		return nil, fmt.Errorf("no %s.%s section", "__LLVM", "__bundle")
 	}
 	data, err := llvmBundle.Data()
 	if err != nil {
@@ -2476,6 +2700,7 @@ func (f *File) parseBinds(r *bytes.Reader, kind types.BindKind) ([]types.Bind, e
 			}
 			bind.Start = f.Segments()[imm].Addr
 			bind.Segment = f.Segments()[imm].Name
+			bind.SegStart = f.Segments()[imm].Offset
 		case types.BIND_OPCODE_ADD_ADDR_ULEB:
 			out, err := trie.ReadUleb128(r)
 			if err != nil {
@@ -2489,7 +2714,7 @@ func (f *File) parseBinds(r *bytes.Reader, kind types.BindKind) ([]types.Bind, e
 				if sec := f.FindSectionForVMAddr(f.Segment(bind.Segment).Addr + segOffset); sec != nil {
 					bind.Section = sec.Name
 				}
-				bind.Offset = segOffset
+				bind.SegOffset = segOffset
 				binds = append(binds, bind)
 				segOffset += f.pointerSize()
 			}
@@ -2497,7 +2722,7 @@ func (f *File) parseBinds(r *bytes.Reader, kind types.BindKind) ([]types.Bind, e
 			if sec := f.FindSectionForVMAddr(f.Segment(bind.Segment).Addr + segOffset); sec != nil {
 				bind.Section = sec.Name
 			}
-			bind.Offset = segOffset
+			bind.SegOffset = segOffset
 			binds = append(binds, bind)
 			off, err := trie.ReadUleb128(r)
 			if err != nil {
@@ -2508,7 +2733,7 @@ func (f *File) parseBinds(r *bytes.Reader, kind types.BindKind) ([]types.Bind, e
 			if sec := f.FindSectionForVMAddr(f.Segment(bind.Segment).Addr + segOffset); sec != nil {
 				bind.Section = sec.Name
 			}
-			bind.Offset = segOffset
+			bind.SegOffset = segOffset
 			binds = append(binds, bind)
 			segOffset += uint64(imm)*f.pointerSize() + f.pointerSize()
 		case types.BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB:
@@ -2524,7 +2749,7 @@ func (f *File) parseBinds(r *bytes.Reader, kind types.BindKind) ([]types.Bind, e
 				if sec := f.FindSectionForVMAddr(f.Segment(bind.Segment).Addr + segOffset); sec != nil {
 					bind.Section = sec.Name
 				}
-				bind.Offset = segOffset
+				bind.SegOffset = segOffset
 				binds = append(binds, bind)
 				segOffset += skip + f.pointerSize()
 			}
@@ -2572,7 +2797,7 @@ func (f *File) parseBinds(r *bytes.Reader, kind types.BindKind) ([]types.Bind, e
 							return nil, fmt.Errorf("bind ordinal is out of range")
 						}
 						ordinalTable[ord].Value = ptr
-						ordinalTable[ord].Offset = segOffset
+						ordinalTable[ord].SegOffset = segOffset
 						binds = append(binds, ordinalTable[ord])
 					}
 					// The delta is bits [51..61]
@@ -2792,7 +3017,9 @@ func (f *File) FindSymbolAddress(symbol string) (uint64, error) {
 	}
 	exports, err := f.GetExports()
 	if err != nil {
-		return 0, fmt.Errorf("failed to get exports: %v", err)
+		if err != ErrMachODyldInfoNotFound {
+			return 0, fmt.Errorf("failed to get exports: %v", err)
+		}
 	}
 	for _, sym := range exports {
 		if strings.EqualFold(sym.Name, symbol) {

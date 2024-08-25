@@ -7,6 +7,10 @@ import (
 	"io"
 )
 
+func (f *File) ExtGetReader() types.MachoReader {
+	return f.cr
+}
+
 func (f *File) ExtReadData(startAddr uint64, endAddr uint64) ([]byte, error) {
 	if startAddr >= endAddr {
 		return nil, fmt.Errorf("failed to read data. invalid range(%d, %d)", startAddr, endAddr)
@@ -29,10 +33,17 @@ func (f *File) ExtReadData(startAddr uint64, endAddr uint64) ([]byte, error) {
 }
 
 func (f *File) ExtGetFileData() ([]byte, error) {
-	f.cr.Seek(0, io.SeekStart)
+	_, err := f.cr.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
 	return io.ReadAll(f.cr)
 }
 
 func (f *File) ExtGetSymbolAddr(index uint32) uint64 {
-	return uint64(f.symbolSize()) * uint64(index) + uint64(f.Symtab.Symoff)
+	return uint64(f.symbolSize())*uint64(index) + uint64(f.Symtab.Symoff)
+}
+
+func (f *File) ExtLinkRequired() bool {
+	return f.Type == types.MH_OBJECT
 }

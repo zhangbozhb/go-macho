@@ -26,6 +26,12 @@ func (f *File) HasSwift() bool {
 			return true
 		}
 	}
+	for _, sec := range f.Sections {
+		switch sec.Name {
+		case "__swift5_types", "__swift5_types2", "__swift5_builtin", "__swift5_fieldmd", "__swift5_assocty", "__swift5_protos", "__swift5_proto", "__swift5_reflstr", "__swift5_capture", "__swift5_typeref", "__swift5_mpenum", "__constg_swiftt", "__swift5_replace", "__swift5_replac2", "__swift5_acfuncs":
+			return true
+		}
+	}
 	return false
 }
 
@@ -1112,17 +1118,27 @@ func (f *File) parseProtocol(r io.ReadSeeker, typ *swift.Type) (prot *swift.Prot
 					if err != nil {
 						return nil, fmt.Errorf("failed to read signature requirement protocol pointer: %v", err)
 					}
-					prot.SignatureRequirements[idx].Kind, err = f.GetBindName(ptr)
-					if err != nil {
-						f.cr.SeekToAddr(ptr)
-						pc, err := f.getContextDesc(ptr)
-						if err != nil {
-							return nil, fmt.Errorf("failed to read signature requirement protocol: %v", err)
+					if ptr == 0 {
+						ptr = req.TypeOrProtocolOrConformanceOrLayoutOff.GetRelPtrAddress()
+						if (ptr & 1) == 1 {
+							ptr = ptr &^ 1
 						}
-						if pc.Parent != "" {
-							prot.SignatureRequirements[idx].Kind = fmt.Sprintf("%s.%s", pc.Parent, pc.Name)
-						} else {
-							prot.SignatureRequirements[idx].Kind = pc.Name
+						if bind, err := f.GetBindName(ptr); err == nil {
+							prot.SignatureRequirements[idx].Kind = bind
+						}
+					} else {
+						prot.SignatureRequirements[idx].Kind, err = f.GetBindName(ptr)
+						if err != nil {
+							f.cr.SeekToAddr(ptr)
+							pc, err := f.getContextDesc(ptr)
+							if err != nil {
+								return nil, fmt.Errorf("failed to read signature requirement protocol: %v", err)
+							}
+							if pc.Parent != "" {
+								prot.SignatureRequirements[idx].Kind = fmt.Sprintf("%s.%s", pc.Parent, pc.Name)
+							} else {
+								prot.SignatureRequirements[idx].Kind = pc.Name
+							}
 						}
 					}
 				}
@@ -1224,6 +1240,13 @@ func (f *File) readProtocolConformance(r io.ReadSeeker, addr uint64) (pcd *swift
 	paddr = f.vma.Convert(paddr)
 	if paddr == 0 {
 		pcd.Protocol = "<stripped>"
+		paddr = pcd.ProtocolOffsest.GetRelPtrAddress()
+		if (paddr & 1) == 1 {
+			paddr = paddr &^ 1
+		}
+		if bind, err := f.GetBindName(paddr); err == nil {
+			pcd.Protocol = bind
+		}
 	} else if bind, err := f.GetBindName(paddr); err == nil {
 		pcd.Protocol = bind
 	} else {
@@ -1255,25 +1278,37 @@ func (f *File) readProtocolConformance(r io.ReadSeeker, addr uint64) (pcd *swift
 			return nil, fmt.Errorf("failed to get indirect type descriptor pointer: %v", err)
 		}
 		ptr = f.vma.Convert(ptr)
-		if bind, err := f.GetBindName(ptr); err == nil {
-			pcd.TypeRef = &swift.Type{
-				Address: ptr,
-				Name:    bind,
+		if ptr == 0 {
+			if (addr & 1) == 1 {
+				addr = addr &^ 1
+			}
+			if bind, err := f.GetBindName(addr); err == nil {
+				pcd.TypeRef = &swift.Type{
+					Address: addr,
+					Name:    bind,
+				}
 			}
 		} else {
-			f.cr.SeekToAddr(ptr)
-			ctx, err := f.getContextDesc(ptr)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get parent: %v", err)
-			}
-			pcd.TypeRef = &swift.Type{
-				Address: ptr,
-				Name:    ctx.Name,
-				Parent: &swift.Type{
-					Name: ctx.Parent,
-				},
-			}
+			if bind, err := f.GetBindName(ptr); err == nil {
+				pcd.TypeRef = &swift.Type{
+					Address: ptr,
+					Name:    bind,
+				}
+			} else {
+				f.cr.SeekToAddr(ptr)
+				ctx, err := f.getContextDesc(ptr)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get parent: %v", err)
+				}
+				pcd.TypeRef = &swift.Type{
+					Address: ptr,
+					Name:    ctx.Name,
+					Parent: &swift.Type{
+						Name: ctx.Parent,
+					},
+				}
 
+			}
 		}
 	case swift.DirectObjCClassName:
 		name, err := f.GetCString(pcd.TypeRefOffsest.GetRelPtrAddress())
@@ -1338,7 +1373,15 @@ func (f *File) readProtocolConformance(r io.ReadSeeker, addr uint64) (pcd *swift
 					return nil, fmt.Errorf("failed to read conditional requirement protocol pointer: %v", err)
 				}
 				ptr = f.vma.Convert(ptr)
-				if bind, err := f.GetBindName(ptr); err == nil {
+				if ptr == 0 {
+					ptr = req.TypeOrProtocolOrConformanceOrLayoutOff.GetRelPtrAddress()
+					if (ptr & 1) == 1 {
+						ptr = ptr &^ 1
+					}
+					if bind, err := f.GetBindName(ptr); err == nil {
+						pcd.ConditionalRequirements[idx].Kind = bind
+					}
+				} else if bind, err := f.GetBindName(ptr); err == nil {
 					pcd.ConditionalRequirements[idx].Kind = bind
 				} else {
 					f.cr.SeekToAddr(ptr)
@@ -1382,6 +1425,13 @@ func (f *File) readProtocolConformance(r io.ReadSeeker, addr uint64) (pcd *swift
 		}
 		if addr == 0 {
 			pcd.ResilientWitnesses[idx].Symbol = "<stripped>"
+			addr = wit.RequirementOff.GetRelPtrAddress()
+			if (addr & 1) == 1 {
+				addr = addr &^ 1
+			}
+			if bind, err := f.GetBindName(addr); err == nil {
+				pcd.ResilientWitnesses[idx].Symbol = bind
+			}
 		} else {
 			if bind, err := f.GetBindName(addr); err == nil {
 				pcd.ResilientWitnesses[idx].Symbol = bind
@@ -2206,7 +2256,15 @@ func (f *File) parseGenericContext(ctx *swift.TypeGenericContext) (err error) {
 						return fmt.Errorf("failed to read generic requirement param protocol pointer: %v", err)
 					}
 					ptr = f.vma.Convert(ptr)
-					if bind, err := f.GetBindName(ptr); err == nil {
+					if ptr == 0 {
+						ptr = req.TypeOrProtocolOrConformanceOrLayoutOff.GetRelPtrAddress()
+						if (ptr & 1) == 1 {
+							ptr = ptr &^ 1
+						}
+						if bind, err := f.GetBindName(ptr); err == nil {
+							ctx.Requirements[idx].Kind = bind
+						}
+					} else if bind, err := f.GetBindName(ptr); err == nil {
 						ctx.Requirements[idx].Kind = bind
 					} else {
 						f.cr.SeekToAddr(ptr)
@@ -2547,15 +2605,11 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 					// part = fmt.Sprintf("<%s>", strings.TrimSuffix(strings.TrimPrefix(part, "y"), "G"))
 					part = strings.TrimSuffix(strings.TrimPrefix(part, "y"), "G")
 				} else if idx == len(parts)-1 { // last part
-					if strings.HasSuffix(part, "G") {
-						part = strings.TrimSuffix(part, "G")
-					}
+					part = strings.TrimSuffix(part, "G")
 					if part == "G" {
 						continue
 					}
-					if strings.HasPrefix(part, "_p") { // I believe this just means that it's a protocol
-						part = strings.TrimPrefix(part, "_p")
-					}
+					part = strings.TrimPrefix(part, "_p") // I believe this just means that it's a protocol
 					if (part == "Qz" || part == "Qy_" || part == "Qy0_") && len(out) == 2 {
 						tmp := out[0]
 						out[0] = out[1] + "." + tmp

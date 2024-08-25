@@ -2,65 +2,82 @@ package objc
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 )
 
-// ref - https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjCRuntimeGuide/Articles/ocrtTypeEncodings.html
+// References:
+// 01. https://clang.llvm.org/docs/LanguageExtensions.html#half-precision-floating-point
+// 02. https://clang.llvm.org/docs/LanguageExtensions.html#vectors-and-extended-vectors
+// 03. https://developer.apple.com/documentation/objectivec/bool#discussion
+// 04. https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms#Handle-data-types-and-data-alignment-properly
+// 05. https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjCRuntimeGuide/Articles/ocrtTypeEncodings.html#//apple_ref/doc/uid/TP40008048-CH100-SW1
+// 06. https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/64bitPorting/transition/transition.html#//apple_ref/doc/uid/TP40001064-CH207-SW1
+// 07. https://gcc.gnu.org/onlinedocs/gcc/Half-Precision.html
+// 08. https://gcc.gnu.org/onlinedocs/gcc/Vector-Extensions.html
+// 09. https://github.com/apple-oss-distributions/clang/blob/rel/clang-800/src/tools/clang/include/clang/AST/DeclBase.h#L173-L200
+// 10. https://github.com/apple-oss-distributions/clang/blob/rel/clang-800/src/tools/clang/include/clang/AST/DeclObjC.h#L698-L727
+// 11. https://github.com/apple-oss-distributions/clang/blob/rel/clang-800/src/tools/clang/lib/AST/ASTContext.cpp#L5452-L5518
+// 12. https://github.com/apple-oss-distributions/objc4/blob/rel/objc4-906/runtime/runtime.h#L1856-L1900
+// 13. https://github.com/apple-oss-distributions/objc4/blob/rel/objc4-838/runtime/hashtable2.h#L251-L294
+// 14. https://github.com/gcc-mirror/gcc/blob/releases/gcc-13.2.0/gcc/doc/objc.texi
+// 15. https://github.com/gcc-mirror/gcc/blob/releases/gcc-13.2.0/gcc/objc/objc-encoding.cc
+// 16. https://github.com/gcc-mirror/gcc/blob/releases/gcc-13.2.0/libobjc/objc/runtime.h#L83-L139
 
 var typeEncoding = map[string]string{
-	"@": "id",
-	"#": "Class",
-	":": "SEL",
-	"c": "char",
-	"C": "unsigned char",
-	"s": "short",
-	"S": "unsigned short",
-	"i": "int",
-	"I": "unsigned int",
-	"l": "long",
-	"L": "unsigned long",
-	"q": "long long",
-	"Q": "unsigned long long",
-	"t": "int128",
-	"T": "unsigned int128",
-	"f": "float",
-	"d": "double",
-	"D": "long double",
-	"b": "bit field",
-	"B": "BOOL",
-	"v": "void",
-	"z": "size_t",
-	"Z": "int32",
-	"w": "wchar_t",
-	"?": "undefined",
-	"^": "*",
-	"*": "char *",
-	"%": "NXAtom",
-	// "[":  "", // _C_ARY_B
-	// "]":  "", // _C_ARY_E
-	// "(":  "", // _C_UNION_B
-	// ")":  "", // _C_UNION_E
-	// "{":  "", // _C_STRUCT_B
-	// "}":  "", // _C_STRUCT_E
-	"!":  "vector",
-	"Vv": "void",
-	"^?": "void *",         // void *
-	"@?": "id /* block */", // block type
-	// "@?": "void (^)(void)", // block type
+	"":     "",                          // Nothing
+	" ":    "_Float16",                  // Half-Precision C Floating-Point (LLVM only)
+	"#":    "Class",                     // Objective-C Class
+	"%":    "const char * /* NXAtom */", // Objective-C NXAtom (legacy Objective-C runtime only)
+	"*":    "char *",                    // C String
+	":":    "SEL",                       // Objective-C Selector
+	"?":    "void * /* unknown */",      // Unknown (likely a C Function and unlikely an Objective-C Block)
+	"@":    "id",                        // Objective-C Pointer
+	"@?":   "id /* block */",            // Objective-C Block Pointer
+	"B":    "_Bool",                     // C Boolean or Objective-C Boolean (on ARM and PowerPC)
+	"C":    "unsigned char",             // Unsigned C Character
+	"D":    "long double",               // Extended-Precision C Floating-Point (64 bits on ARM, 80 bits on Intel, and 128 bits on PowerPC)
+	"I":    "unsigned int",              // Unsigned C Integer
+	"L":    "unsigned int32_t",          // Unsigned C Long Integer (fixed to 32 bits)
+	"Q":    "unsigned long long",        // Unsigned C Long-Long Integer
+	"S":    "unsigned short",            // Unsigned C Short Integer
+	"T":    "unsigned __int128",         // Unsigned C 128-bit Integer
+	"^(?)": "void * /* union */",        // C Union Pointer
+	"^?":   "void * /* function */",     // C Function Pointer
+	"^{?}": "void * /* struct */",       // C Struct Pointer
+	"c":    "signed char",               // Signed C Character (fixed signedness) or Objective-C Boolean (on Intel)
+	"d":    "double",                    // Double-Precision C Floating-Point
+	"f":    "float",                     // Single-Precision C Floating-Point
+	"i":    "int",                       // Signed C Integer
+	"l":    "int32_t",                   // Signed C Long Integer (fixed to 32 bits)
+	"q":    "long long",                 // Signed C Long-Long Integer
+	"s":    "short",                     // Signed C Short Integer
+	"t":    "__int128",                  // Signed C 128-bit Integer
+	"v":    "void",                      // C Void
+	// "!": "", // GNU Vector (LLVM Vector is unrepresented)
+	// "^": "", // C Pointer
+	// "b": "", // C Bit Field
+	// "(": "", // C Union Begin
+	// ")": "", // C Union End
+	// "[": "", // C Array Begin
+	// "]": "", // C Array End
+	// "{": "", // C Struct Begin
+	// "}": "", // C Struct End
 }
+
 var typeSpecifiers = map[string]string{
-	"A": "atomic",
-	"j": "_Complex",
-	"!": "vector",
-	"r": "const",
-	"n": "in",
+	"+": "/* gnu register */", // TODO: review
+	"A": "_Atomic",
 	"N": "inout",
+	"O": "bycopy",
+	"R": "byref",
+	"V": "oneway",
+	"j": "_Complex",
+	"n": "in",
 	"o": "out",
-	"O": "by copy",
-	"R": "by ref",
-	"V": "one way",
-	"+": "gnu register",
+	"r": "const",
+	"|": "/* gc invisible */", // TODO: review
 }
 
 const (
@@ -76,6 +93,7 @@ const (
 	propertyStrong    = "P" // property GC'able
 	propertyAtomic    = "A" // property atomic
 	propertyNonAtomic = "N" // property non-atomic
+	propertyOptional  = "?" // property optional
 )
 
 type methodEncodedArg struct {
@@ -127,6 +145,17 @@ func getLastCapitalizedPart(s string) string {
 	return strings.ToLower(s[start:])
 }
 
+func isReserved(s string) bool {
+	switch s {
+	case "alignas", "alignof", "auto", "bool", "break", "case", "char", "const", "constexpr", "continue", "default", "do", "double", "else", "enum", "extern", "false", "float", "for", "goto", "if", "inline", "int", "long", "nullptr", "register", "restrict", "return", "short", "signed", "sizeof", "static", "static_assert", "struct", "switch", "thread_local", "true", "typedef", "typeof", "typeof_unqual", "union", "unsigned", "void", "volatile", "while":
+		return true // C Keywords
+	case "and", "and_eq", "asm", "atomic_cancel", "atomic_commit", "atomic_noexcept", "bitand", "bitor", "catch", "char8_t", "char16_t", "char32_t", "class", "compl", "concept", "consteval", "constinit", "const_cast", "co_await", "co_return", "co_yield", "decltype", "delete", "dynamic_cast", "explicit", "export", "friend", "mutable", "namespace", "new", "noexcept", "not", "not_eq", "operator", "or", "or_eq", "private", "protected", "public", "reflexpr", "reinterpret_cast", "requires", "static_cast", "synchronized", "template", "this", "throw", "try", "typeid", "typename", "using", "virtual", "wchar_t", "xor", "xor_eq":
+		return true // C++ Keywords
+	default:
+		return false
+	}
+}
+
 func getMethodWithArgs(method, returnType string, args []string) string {
 	if len(args) <= 2 {
 		return fmt.Sprintf("(%s)%s;", returnType, method)
@@ -139,6 +168,9 @@ func getMethodWithArgs(method, returnType string, args []string) string {
 	if len(parts) > 1 { // method has arguments based on SEL having ':'
 		for idx, part := range parts {
 			argName := getLastCapitalizedPart(part)
+			if isReserved(argName) {
+				argName = "_" + argName
+			}
 			if len(part) == 0 || idx >= len(args) {
 				break
 			}
@@ -169,6 +201,7 @@ func getPropertyType(attrs string) (typ string) {
 				propertyStrong,
 				propertyAtomic,
 				propertyNonAtomic,
+				propertyOptional,
 				propertyType:
 				typParts = append([]string{strings.TrimPrefix(sub, propertyType)}, typParts...)
 				attr = strings.Join(typParts, ",")
@@ -178,10 +211,12 @@ func getPropertyType(attrs string) (typ string) {
 		}
 		if strings.HasPrefix(attr, "@\"") {
 			typ = strings.Trim(attr, "@\"")
+			typ = strings.ReplaceAll(typ, "><", ", ")
 			if strings.HasPrefix(typ, "<") {
-				typ = "NSObject" + typ
+				typ = "id " + typ + " "
+			} else {
+				typ += " *"
 			}
-			typ += " *"
 		} else {
 			typ = decodeType(attr) + " "
 		}
@@ -191,10 +226,12 @@ func getPropertyType(attrs string) (typ string) {
 	return typ
 }
 
-func getPropertyAttributeTypes(attrs string) string {
+func getPropertyAttributeTypes(attrs string) (string, bool) {
 	// var ivarStr string
 	var attrsStr string
 	var attrsList []string
+
+	isOptional := false
 
 	for _, attr := range strings.Split(attrs, ",") {
 		if strings.HasPrefix(attr, propertyIVar) {
@@ -225,9 +262,12 @@ func getPropertyAttributeTypes(attrs string) string {
 		case propertyWeak:
 			attrsList = append(attrsList, "weak")
 		case propertyDynamic:
-			attrsList = append(attrsList, "@dynamic")
+			// omit the @dynamic directive because it must never appear inside
+			// @interface and @protocol blocks, only in @implementation blocks
 		case propertyStrong:
 			attrsList = append(attrsList, "collectable")
+		case propertyOptional:
+			isOptional = true
 		}
 	}
 
@@ -235,14 +275,15 @@ func getPropertyAttributeTypes(attrs string) string {
 		attrsStr = fmt.Sprintf("(%s) ", strings.Join(attrsList, ", "))
 	}
 
-	return attrsStr
+	return attrsStr, isOptional
 }
 
 func getIVarType(ivType string) string {
 	if strings.HasPrefix(ivType, "@\"") && len(ivType) > 1 {
 		ivType = strings.Trim(ivType, "@\"")
+		ivType = strings.ReplaceAll(ivType, "><", ", ")
 		if strings.HasPrefix(ivType, "<") {
-			ivType = "NSObject" + ivType
+			return "id " + ivType + " "
 		}
 		return ivType + " *"
 	}
@@ -259,37 +300,30 @@ func getReturnType(types string) string {
 func decodeType(encType string) string {
 	var s string
 
-	if len(encType) == 0 {
-		return ""
-	}
-
-	if strings.HasPrefix(encType, "^") {
-		return decodeType(encType[1:]) + " *" // pointer
-	}
-
-	if strings.HasPrefix(encType, "@?") {
-		if len(encType) > 2 { // TODO: remove this??
-			pointerType := decodeType(encType[2:])
-			return "id  ^" + pointerType
-		} else {
-			return "id /* block */"
-		}
-	}
-
-	if strings.HasPrefix(encType, "^?") {
-		if len(encType) > 2 {
-			pointerType := decodeType(encType[2:])
-			return "void * " + pointerType
-		} else {
-			return "void *"
-		}
-	}
-
 	if typ, ok := typeEncoding[encType]; ok {
 		return typ
 	}
 
-	if spec, ok := typeSpecifiers[string(encType[0])]; ok {
+	if strings.HasPrefix(encType, "^") {
+		if typ, ok := typeEncoding[encType]; ok {
+			return typ
+		}
+
+		decType := decodeType(encType[1:])
+
+		if len(encType) > 1 && encType[1] == '!' {
+			return strings.Replace(decType, "x", "*x", 1) // vector pointer
+		}
+
+		return decType + " *" // pointer
+	}
+
+	if spec, ok := typeSpecifiers[string(encType[0])]; ok { // TODO: can there be more than 2 specifiers?
+		if len(encType) > 1 {
+			if spec2, ok := typeSpecifiers[string(encType[1])]; ok {
+				return spec2 + " " + spec + " " + decodeType(encType[2:])
+			}
+		}
 		return spec + " " + decodeType(encType[1:])
 	}
 
@@ -302,18 +336,30 @@ func decodeType(encType string) string {
 	}
 
 	if len(encType) > 2 {
-		if strings.HasPrefix(encType, "[") { // ARRAY
+		switch encType[0] {
+		case '!': // VECTOR
+			inner := encType[strings.IndexByte(encType, '[')+1 : strings.LastIndexByte(encType, ']')]
+			s += decodeVector(inner)
+
+		case '(': // UNION
+			inner := encType[strings.IndexByte(encType, '(')+1 : strings.LastIndexByte(encType, ')')]
+			s += decodeUnion(inner)
+
+		case '[': // ARRAY
 			inner := encType[strings.IndexByte(encType, '[')+1 : strings.LastIndexByte(encType, ']')]
 			s += decodeArray(inner)
-		} else if strings.HasPrefix(encType, "{") { // STRUCT
+
+		case '{': // STRUCT
 			if !(strings.Contains(encType, "{") && strings.Contains(encType, "}")) {
 				return "?"
 			}
 			inner := encType[strings.IndexByte(encType, '{')+1 : strings.LastIndexByte(encType, '}')]
 			s += decodeStructure(inner)
-		} else if strings.HasPrefix(encType, "(") { // UNION
-			inner := encType[strings.IndexByte(encType, '(')+1 : strings.LastIndexByte(encType, ')')]
-			s += decodeUnion(inner)
+
+		case '<': // block func prototype
+			inner := encType[strings.IndexByte(encType, '<')+1 : strings.LastIndexByte(encType, '>')]
+			ret, args := decodeMethodTypes(inner)
+			s += fmt.Sprintf("(%s (^)(%s))", ret, strings.Join(args, " "))
 		}
 	}
 
@@ -325,11 +371,21 @@ func decodeType(encType string) string {
 }
 
 func decodeArray(arrayType string) string {
-	numIdx := strings.LastIndexAny(arrayType, "0123456789")
-	if len(arrayType) == 1 {
-		return fmt.Sprintf("x[%s]", arrayType)
+	typIdx := 0
+	for _, c := range arrayType {
+		if c < '0' || c > '9' {
+			break
+		}
+
+		typIdx++
 	}
-	return fmt.Sprintf("%s x[%s]", decodeType(arrayType[numIdx+1:]), arrayType[:numIdx+1])
+
+	decType := decodeType(arrayType[typIdx:])
+	if !strings.HasSuffix(decType, "*") {
+		decType += " "
+	}
+
+	return fmt.Sprintf("%sx[%s]", decType, arrayType[:typIdx])
 }
 
 func decodeStructure(structure string) string {
@@ -340,9 +396,30 @@ func decodeUnion(unionType string) string {
 	return decodeStructOrUnion(unionType, "union")
 }
 
+var (
+	vectorRegExp = regexp.MustCompile(`(?P<size>\d+),(?P<alignment>\d+)(?P<type>.+)`)
+)
+
+func decodeVector(vectorType string) string {
+	matches := vectorRegExp.FindStringSubmatch(vectorType)
+	if len(matches) != 4 {
+		return ""
+	}
+
+	vSize := matches[1]
+	vAlignment := matches[2]
+
+	eType := decodeType(matches[3])
+	if !strings.HasSuffix(eType, "*") {
+		eType += " "
+	}
+
+	return fmt.Sprintf("%sx __attribute__((aligned(%s), vector_size(%s)))", eType, vAlignment, vSize)
+}
+
 func decodeBitfield(bitfield string) string {
 	span := encodingGetSizeOfArguments(bitfield)
-	return fmt.Sprintf("unsigned int x :%d", span)
+	return fmt.Sprintf("unsigned int x:%d", span)
 }
 
 func getFieldName(field string) (string, string) {
@@ -355,6 +432,10 @@ func getFieldName(field string) (string, string) {
 	}
 	return "", field
 }
+
+var (
+	vectorIdentifierRegExp = regexp.MustCompile(`(.+[ *])x( __attribute__.+)`)
+)
 
 func decodeStructOrUnion(typ, kind string) string {
 	name, rest, _ := strings.Cut(typ, "=")
@@ -374,26 +455,54 @@ func decodeStructOrUnion(typ, kind string) string {
 	field, rest, ok := CutType(rest)
 
 	for ok {
-		if fieldName != "" {
-			dtype := decodeType(field)
-			if strings.HasSuffix(dtype, " *") {
-				fields = append(fields, fmt.Sprintf("%s%s;", dtype, fieldName))
+		// Although technically possible, binaries produced by clang never have a
+		// mix of named and unnamed fields in the same struct. This assumption is
+		// necessary to disambiguate {"x0"@"x1"c}.
+		if fieldName != "" && rest != "" && strings.HasSuffix(field, `"`) && !strings.HasPrefix(rest, `"`) {
+			penultQuoteIdx := strings.LastIndex(strings.TrimRight(field, `"`), `"`)
+			if penultQuoteIdx == -1 {
+				rest = field + rest
+				field = "id"
 			} else {
-				fields = append(fields, fmt.Sprintf("%s %s;", dtype, fieldName))
+				rest = field[penultQuoteIdx:] + rest
+				field = field[:penultQuoteIdx]
 			}
-		} else {
-			if strings.HasPrefix(field, "b") {
-				span := encodingGetSizeOfArguments(field)
-				fields = append(fields, fmt.Sprintf("unsigned int x%d :%d;", idx, span))
-			} else if strings.HasPrefix(field, "[") {
-				array := decodeType(field)
-				array = strings.TrimSpace(strings.Replace(array, "x", fmt.Sprintf("x%d", idx), 1))
-				fields = append(fields, array)
-			} else {
-				fields = append(fields, fmt.Sprintf("%s x%d;", decodeType(field), idx))
-			}
-			idx++
 		}
+
+		if fieldName == "" {
+			fieldName = fmt.Sprintf("x%d", idx)
+		}
+
+		if strings.HasPrefix(field, "b") {
+			span := encodingGetSizeOfArguments(field)
+			fields = append(fields, fmt.Sprintf("unsigned int %s:%d;", fieldName, span))
+		} else if strings.HasPrefix(field, "[") {
+			array := decodeType(field)
+			array = strings.TrimSpace(strings.Replace(array, "x", fieldName, 1)) + ";"
+			fields = append(fields, array)
+		} else {
+			decType := decodeType(field)
+			if !strings.HasSuffix(decType, "))") {
+				if !strings.HasSuffix(decType, "*") {
+					decType += " "
+				}
+
+				fields = append(fields, fmt.Sprintf("%s%s;", decType, fieldName))
+			} else {
+				matches := vectorIdentifierRegExp.FindStringSubmatchIndex(decType)
+				if len(matches) != 6 {
+					fields = append(fields, fmt.Sprintf("%s%s;", decType, fieldName))
+				} else {
+					prefix := decType[:matches[3]]
+					suffix := decType[matches[4]:]
+
+					fields = append(fields, fmt.Sprintf("%s%s%s;", prefix, fieldName, suffix))
+				}
+			}
+		}
+
+		idx++
+
 		fieldName, rest = getFieldName(rest)
 		field, rest, ok = CutType(rest)
 	}
@@ -406,17 +515,27 @@ func skipFirstType(typStr string) string {
 	typ := []byte(typStr)
 	for {
 		switch typ[i] {
+		case '+': /* gnu register */
+			fallthrough
+		case 'A': /* _Atomic */
+			fallthrough
+		case 'N': /* inout */
+			fallthrough
 		case 'O': /* bycopy */
+			fallthrough
+		case 'R': /* byref */
+			fallthrough
+		case 'V': /* oneway */
+			fallthrough
+		case 'j': /* _Complex */
 			fallthrough
 		case 'n': /* in */
 			fallthrough
 		case 'o': /* out */
 			fallthrough
-		case 'N': /* inout */
-			fallthrough
 		case 'r': /* const */
 			fallthrough
-		case 'V': /* oneway */
+		case '|': /* gc invisible */
 			fallthrough
 		case '^': /* pointers */
 			i++
@@ -431,6 +550,12 @@ func skipFirstType(typStr string) string {
 				i++
 			}
 			return string(typ[i+1:])
+		case '!': /* vectors */
+			i += 2
+			for typ[i] == ',' || typ[i] >= '0' && typ[i] <= '9' {
+				i++
+			}
+			return string(typ[i+subtypeUntil(string(typ[i:]), ']')+1:])
 		case '[': /* arrays */
 			i++
 			for typ[i] >= '0' && typ[i] <= '9' {
@@ -443,6 +568,9 @@ func skipFirstType(typStr string) string {
 		case '(': /* unions */
 			i++
 			return string(typ[i+subtypeUntil(string(typ[i:]), ')')+1:])
+		case '<': /* block func prototype */
+			i++
+			return string(typ[i+subtypeUntil(string(typ[i:]), '>')+1:])
 		default: /* basic types */
 			i++
 			return string(typ[i:])
@@ -458,9 +586,9 @@ func subtypeUntil(typ string, end byte) int {
 			return len(head) - len(typ)
 		}
 		switch typ[0] {
-		case ']', '}', ')':
+		case ']', '}', ')', '>':
 			level -= 1
-		case '[', '{', '(':
+		case '[', '{', '(', '<':
 			level += 1
 		}
 		typ = typ[1:]
@@ -481,17 +609,27 @@ func CutType(typStr string) (string, string, bool) {
 	typ := []byte(typStr)
 	for {
 		switch typ[i] {
+		case '+': /* gnu register */
+			fallthrough
+		case 'A': /* _Atomic */
+			fallthrough
+		case 'N': /* inout */
+			fallthrough
 		case 'O': /* bycopy */
+			fallthrough
+		case 'R': /* byref */
+			fallthrough
+		case 'V': /* oneway */
+			fallthrough
+		case 'j': /* _Complex */
 			fallthrough
 		case 'n': /* in */
 			fallthrough
 		case 'o': /* out */
 			fallthrough
-		case 'N': /* inout */
-			fallthrough
 		case 'r': /* const */
 			fallthrough
-		case 'V': /* oneway */
+		case '|': /* gc invisible */
 			fallthrough
 		case '^': /* pointers */
 			i++
@@ -512,6 +650,12 @@ func CutType(typStr string) (string, string, bool) {
 				i++
 			}
 			return string(typ[:i]), string(typ[i:]), true
+		case '!': /* vectors */
+			i += 2
+			for typ[i] == ',' || typ[i] >= '0' && typ[i] <= '9' {
+				i++
+			}
+			return string(typ[:i+subtypeUntil(string(typ[i:]), ']')+1]), string(typ[i+subtypeUntil(string(typ[i:]), ']')+1:]), true
 		case '[': /* arrays */
 			i++
 			for typ[i] >= '0' && typ[i] <= '9' {
@@ -524,6 +668,9 @@ func CutType(typStr string) (string, string, bool) {
 		case '(': /* unions */
 			i++
 			return string(typ[:i+subtypeUntil(string(typ[i:]), ')')+1]), string(typ[i+subtypeUntil(string(typ[i:]), ')')+1:]), true
+		case '<': /* block func prototype */
+			i++
+			return string(typ[:i+subtypeUntil(string(typ[i:]), '>')+1]), string(typ[i+subtypeUntil(string(typ[i:]), '>')+1:]), true
 		default: /* basic types */
 			i++
 			return string(typ[:i]), string(typ[i:]), true

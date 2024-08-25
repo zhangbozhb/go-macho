@@ -467,6 +467,17 @@ func (f *File) GetObjCClass(vmaddr uint64) (*objc.Class, error) {
 				f.PutObjC(classPtr.SuperclassVMAddr, superClass)
 			}
 		}
+	} else {
+		bind, err := f.GetBindName(vmaddr + uint64(unsafe.Offsetof(classPtr.SuperclassVMAddr)))
+		if err == nil {
+			if info.Flags.IsRoot() {
+				superClass = &objc.Class{Name: bind}
+			} else if info.Flags.IsMeta() {
+				superClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_METACLASS_$_")}
+			} else {
+				superClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_CLASS_$_")}
+			}
+		}
 	}
 
 	isaClass := &objc.Class{}
@@ -495,6 +506,17 @@ func (f *File) GetObjCClass(vmaddr uint64) (*objc.Class, error) {
 					}
 				}
 				f.PutObjC(classPtr.IsaVMAddr, isaClass)
+			}
+		}
+	} else {
+		bind, err := f.GetBindName(vmaddr + uint64(unsafe.Offsetof(classPtr.IsaVMAddr)))
+		if err == nil {
+			if info.Flags.IsRoot() {
+				isaClass = &objc.Class{Name: bind}
+			} else if info.Flags.IsMeta() {
+				isaClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_METACLASS_$_")}
+			} else {
+				isaClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_CLASS_$_")}
 			}
 		}
 	}
@@ -610,7 +632,7 @@ func (f *File) GetObjCClass2(vmaddr uint64) (*objc.Class, error) {
 			if c, ok := f.GetObjC(classPtr.SuperclassVMAddr); ok {
 				superClass = c.(*objc.Class)
 			} else {
-				superClass, err = f.GetObjCClass(classPtr.SuperclassVMAddr)
+				superClass, err = f.GetObjCClass2(classPtr.SuperclassVMAddr)
 				if err != nil {
 					if f.HasFixups() {
 						bindName, err := f.GetBindName(classPtr.SuperclassVMAddr)
@@ -624,6 +646,17 @@ func (f *File) GetObjCClass2(vmaddr uint64) (*objc.Class, error) {
 					}
 				}
 				f.PutObjC(classPtr.SuperclassVMAddr, superClass)
+			}
+		}
+	} else {
+		bind, err := f.GetBindName(vmaddr + uint64(unsafe.Offsetof(classPtr.SuperclassVMAddr)))
+		if err == nil {
+			if info.Flags.IsRoot() {
+				superClass = &objc.Class{Name: bind}
+			} else if info.Flags.IsMeta() {
+				superClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_METACLASS_$_")}
+			} else {
+				superClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_CLASS_$_")}
 			}
 		}
 	}
@@ -654,6 +687,17 @@ func (f *File) GetObjCClass2(vmaddr uint64) (*objc.Class, error) {
 					}
 				}
 				f.PutObjC(classPtr.IsaVMAddr, isaClass)
+			}
+		}
+	} else {
+		bind, err := f.GetBindName(vmaddr + uint64(unsafe.Offsetof(classPtr.IsaVMAddr)))
+		if err == nil {
+			if info.Flags.IsRoot() {
+				isaClass = &objc.Class{Name: bind}
+			} else if info.Flags.IsMeta() {
+				isaClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_METACLASS_$_")}
+			} else {
+				isaClass = &objc.Class{Name: strings.TrimPrefix(bind, "_OBJC_CLASS_$_")}
 			}
 		}
 	}
@@ -713,7 +757,7 @@ func (f *File) GetObjCCategories() ([]objc.Category, error) {
 						return nil, fmt.Errorf("failed to read %T: %v", categoryPtr, err)
 					}
 
-					category := objc.Category{VMAddr: f.rebasePtr(ptr)}
+					category := objc.Category{VMAddr: f.rebasePtr(ptr), Class: &objc.Class{}}
 
 					categoryPtr.NameVMAddr = f.vma.Convert(categoryPtr.NameVMAddr)
 					category.Name, err = f.GetCString(categoryPtr.NameVMAddr)
@@ -729,16 +773,31 @@ func (f *File) GetObjCCategories() ([]objc.Category, error) {
 							if err != nil {
 								if f.HasFixups() {
 									bindName, err := f.GetBindName(categoryPtr.ClsVMAddr)
-									if err == nil {
-										category.Class = &objc.Class{Name: strings.TrimPrefix(bindName, "_OBJC_CLASS_$_")}
+									if err != nil {
+										if !errors.Is(err, ErrMachONoBindInfo) {
+											return nil, fmt.Errorf("failed to read super class objc_class_t at vmaddr: %#x; %v", categoryPtr.ClsVMAddr, err)
+										}
 									} else {
-										return nil, fmt.Errorf("failed to read super class objc_class_t at vmaddr: %#x; %v", categoryPtr.ClsVMAddr, err)
+										category.Class = &objc.Class{Name: strings.TrimPrefix(bindName, "_OBJC_CLASS_$_")}
 									}
-								} else {
-									category.Class = &objc.Class{}
 								}
 							}
 							f.PutObjC(categoryPtr.ClsVMAddr, category.Class)
+						}
+					} else {
+						if c, ok := f.objc[categoryPtr.ClsVMAddr]; ok {
+							category.Class = c.(*objc.Class)
+						} else {
+							category.Class = &objc.Class{}
+							bindName, err := f.GetBindName(ptr + uint64(unsafe.Offsetof(categoryPtr.ClsVMAddr)))
+							if err != nil {
+								if !errors.Is(err, ErrMachONoBindInfo) {
+									return nil, fmt.Errorf("failed to read super class objc_class_t at vmaddr: %#x; %v", ptr+uint64(unsafe.Offsetof(categoryPtr.ClsVMAddr)), err)
+								}
+							} else {
+								category.Class = &objc.Class{Name: strings.TrimPrefix(bindName, "_OBJC_CLASS_$_")}
+								f.PutObjC(ptr+uint64(unsafe.Offsetof(categoryPtr.ClsVMAddr)), category.Class)
+							}
 						}
 					}
 					if categoryPtr.InstanceMethodsVMAddr > 0 {
@@ -1504,9 +1563,6 @@ func (f *File) GetCFStrings() ([]objc.CFString, error) {
 					cfstrings[idx].Class = c.(*objc.Class)
 				}
 				cfstrings[idx].Address = sec.Addr + uint64(idx*binary.Size(objc.CFString64Type{}))
-				if err != nil {
-					return nil, fmt.Errorf("failed to calulate cfstring vmaddr: %v", err)
-				}
 			}
 		}
 	}

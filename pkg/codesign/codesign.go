@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/blacktop/go-macho/pkg/codesign/types"
+	mtypes "github.com/blacktop/go-macho/types"
 )
 
 // CodeSignature object
@@ -434,6 +435,7 @@ type Config struct {
 	EntitlementsDER     []byte
 	ResourceDirSlotHash []byte
 	SlotHashes          slotHashes
+	RuntimeVersion      mtypes.Version
 	CertChain           []*x509.Certificate
 	SignerFunction      func([]byte) ([]byte, error)
 }
@@ -460,13 +462,15 @@ func Sign(r io.Reader, config *Config) ([]byte, error) {
 	sb := types.NewSuperBlob(types.MAGIC_EMBEDDED_SIGNATURE)
 
 	// Requirements /////////////////////////////////////////////
-	reqBlob, err = types.CreateRequirements(config.ID, config.CertChain)
+	reqBlob, err = types.CreateRequirements(config.ID, config.CertChain, config.Flags == types.ADHOC)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Requirements: %v", err)
 	}
-	config.SlotHashes.Requirements, err = reqBlob.Sha256Hash()
-	if err != nil {
-		return nil, fmt.Errorf("failed to hash Requirements: %v", err)
+	if config.Flags != types.ADHOC {
+		config.SlotHashes.Requirements, err = reqBlob.Sha256Hash()
+		if err != nil {
+			return nil, fmt.Errorf("failed to hash Requirements: %v", err)
+		}
 	}
 
 	config.NSpecialSlots = uint32(2)
@@ -547,6 +551,28 @@ func Sign(r io.Reader, config *Config) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func nCodeSlots(config *Config) uint32 {
+	return uint32((int(config.CodeSize) + types.PAGE_SIZE - 1) / types.PAGE_SIZE)
+}
+
+func EstimateCodeSignatureSize(config *Config) uint64 {
+	cdHeaderSize := binary.Size(types.BlobHeader{}) + binary.Size(types.CodeDirectoryType{})
+	cdVariableSize := len(config.ID) + 1 + len(types.EmptySha256Slot)*int(config.NSpecialSlots+nCodeSlots(config))
+	extraSlotsSize := 0
+	if len(config.Entitlements) > 0 {
+		extraSlotsSize += binary.Size(types.BlobHeader{}) + len(config.Entitlements)
+	}
+	if len(config.EntitlementsDER) > 0 {
+		extraSlotsSize += binary.Size(types.BlobHeader{}) + len(config.EntitlementsDER)
+	}
+	extraSlotsSize += 1024 // guess at maximum size of requirements
+	sigSize := 1 << 14     // guess at size of CMS blob, including timestamp
+	for _, cert := range config.CertChain {
+		sigSize += len(cert.Raw)
+	}
+	return uint64(cdHeaderSize + cdVariableSize + extraSlotsSize + sigSize)
+}
+
 func createCodeDirectory(r io.Reader, config *Config) (*bytes.Buffer, error) {
 	var cddelta int
 	var cdbuf bytes.Buffer
@@ -593,24 +619,37 @@ func createCodeDirectory(r io.Reader, config *Config) (*bytes.Buffer, error) {
 
 	// calculate the CodeDirectory offsets
 	identOffset := uint32(binary.Size(types.BlobHeader{}) + binary.Size(types.CodeDirectoryType{}))
-	hashOffset := identOffset + uint32(len(config.ID)+1+len(types.EmptySha256Slot)*int(config.NSpecialSlots))
+	teamOffset := uint32(binary.Size(types.BlobHeader{}) + binary.Size(types.CodeDirectoryType{}) + len(config.ID) + 1)
+	teamLen := len(config.TeamID)
+	if teamLen > 0 {
+		teamLen++
+	} else {
+		teamOffset = 0
+	}
+	hashOffset := identOffset + uint32(len(config.ID)+1+teamLen+len(types.EmptySha256Slot)*int(config.NSpecialSlots))
 
 	cdHeader := types.CodeDirectoryType{
 		CdEarliest: types.CdEarliest{
-			Version:       types.SUPPORTS_EXECSEG, // TODO: support other versions (e.g.SUPPORTS_RUNTIME)
+			Version:       types.SUPPORTS_RUNTIME, // TODO: support other versions (e.g.SUPPORTS_LINKAGE)
 			Flags:         config.Flags,
 			HashOffset:    hashOffset,
 			IdentOffset:   identOffset,
 			NSpecialSlots: config.NSpecialSlots,
-			NCodeSlots:    uint32((int(config.CodeSize) + types.PAGE_SIZE - 1) / types.PAGE_SIZE),
+			NCodeSlots:    nCodeSlots(config),
 			CodeLimit:     uint32(config.CodeSize),
 			HashSize:      sha256.Size,
 			HashType:      types.HASHTYPE_SHA256,
 			PageSize:      uint8(types.PAGE_SIZE_BITS),
 		},
+		CdTeamID: types.CdTeamID{
+			TeamOffset: teamOffset,
+		},
 		CdExecSeg: types.CdExecSeg{
 			ExecSegBase:  uint64(config.TextOffset),
 			ExecSegLimit: uint64(config.TextSize),
+		},
+		CdRuntime: types.CdRuntime{
+			Runtime: config.RuntimeVersion,
 		},
 	}
 
@@ -639,6 +678,9 @@ func createCodeDirectory(r io.Reader, config *Config) (*bytes.Buffer, error) {
 	// adjust CodeDirectory header offsets
 	cdHeader.IdentOffset -= uint32(cddelta)
 	cdHeader.HashOffset -= uint32(cddelta)
+	if cdHeader.TeamOffset != 0 {
+		cdHeader.TeamOffset -= uint32(cddelta)
+	}
 
 	if config.IsMain {
 		cdHeader.ExecSegFlags = types.EXECSEG_MAIN_BINARY
@@ -653,6 +695,12 @@ func createCodeDirectory(r io.Reader, config *Config) (*bytes.Buffer, error) {
 	// write CodeDirectory identifier
 	if _, err := cdbuf.WriteString(config.ID + "\x00"); err != nil {
 		return nil, fmt.Errorf("failed to write identifier %s: %v", config.ID, err)
+	}
+	// write team identifier
+	if len(config.TeamID) > 0 {
+		if _, err := cdbuf.WriteString(config.TeamID + "\x00"); err != nil {
+			return nil, fmt.Errorf("failed to write team identifier %s: %v", config.TeamID, err)
+		}
 	}
 	if len(config.Entitlements) > 0 {
 		// write CodeDirectory Entitlements ASN1/DER slot hash

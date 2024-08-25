@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf16"
+	"unsafe"
 )
 
 const (
@@ -275,7 +276,7 @@ func (f *File) ExtSectionReaderAsUString(sec *types.Section, handle func(name st
 }
 
 func (f *File) ExtGetRelocSymbolAddr(addr uint64) *Symbol {
-	if f.reloc == nil {
+	if f.relocMap == nil {
 		relocInfo := make(map[uint64]*Symbol)
 		for _, section := range f.Sections {
 			syms := f.Symtab.Syms
@@ -288,9 +289,9 @@ func (f *File) ExtGetRelocSymbolAddr(addr uint64) *Symbol {
 				}
 			}
 		}
-		f.reloc = relocInfo
+		f.relocMap = relocInfo
 	}
-	return f.reloc[addr]
+	return f.relocMap[addr]
 }
 
 // ExtGetStrings
@@ -600,7 +601,7 @@ func (f *File) ExtGetBindName(pointer uint64) (string, error) {
 		// 注意这里赋值不能使用 forr bind地址，由于地址均是同一个
 		for i := 0; i < count; i++ {
 			bind := &f.binds[i]
-			address := bind.Start + bind.Offset
+			address := bind.Start + bind.SegOffset
 			f.bindsMap.Store(address, bind)
 		}
 	}
@@ -743,7 +744,7 @@ func (f *File) ExtGetObjCClass(vmaddr uint64, simple bool) (*objc.Class, error) 
 			}
 		}
 	} else {
-		superClassNameAddr := vmaddr + f.pointerSize()
+		superClassNameAddr := uint64(unsafe.Offsetof(classPtr.SuperclassVMAddr))
 		bindName, err := f.ExtGetBindName(superClassNameAddr)
 		if err != nil {
 			debugTrack(err)
@@ -780,9 +781,17 @@ func (f *File) ExtGetObjCClass(vmaddr uint64, simple bool) (*objc.Class, error) 
 				f.PutObjC(classPtr.IsaVMAddr, isaClass)
 			}
 		}
+	} else {
+		isaClassNameAddr := vmaddr + uint64(unsafe.Offsetof(classPtr.IsaVMAddr))
+		bindName, err := f.ExtGetBindName(isaClassNameAddr)
+		if err != nil {
+			debugTrack(err)
+		} else {
+			isaClass.Name = FormatClassName(bindName)
+		}
 	}
 
-	return &objc.Class{
+	cls := &objc.Class{
 		Name:                  name,
 		SuperClass:            superClass.Name,
 		Isa:                   isaClass.Name,
@@ -800,7 +809,9 @@ func (f *File) ExtGetObjCClass(vmaddr uint64, simple bool) (*objc.Class, error) 
 		IsSwiftLegacy:         classPtr.DataVMAddrAndFastFlags&objc.FAST_IS_SWIFT_LEGACY != 0,
 		IsSwiftStable:         classPtr.DataVMAddrAndFastFlags&objc.FAST_IS_SWIFT_STABLE != 0,
 		ReadOnlyData:          *info,
-	}, nil
+	}
+	f.PutObjC(vmaddr, cls)
+	return cls, nil
 }
 
 // ExtGetObjCClasses
@@ -1082,7 +1093,7 @@ func (f *File) ExtGetObjCCategory(vmaddr uint64) (cat *objc.Category, err error)
 		if c, ok := f.objc[categoryPtr.ClsVMAddr]; ok {
 			category.Class = c.(*objc.Class)
 		} else {
-			category.Class, err = f.GetObjCClass(categoryPtr.ClsVMAddr)
+			category.Class, err = f.ExtGetObjCClass(categoryPtr.ClsVMAddr, false)
 			if err != nil {
 				if f.HasFixups() {
 					bindName, err := f.ExtGetBindName(categoryPtr.ClsVMAddr)
@@ -1348,7 +1359,7 @@ func (f *File) ExtGetBlocks() ([]*types.ObjcBlock, error) {
 		} else {
 			continue
 		}
-		vmaddr := bind.Start + bind.Offset
+		vmaddr := bind.Start + bind.SegOffset
 		if err := dataReader.SeekToAddr(vmaddr); err != nil {
 			continue
 		}
