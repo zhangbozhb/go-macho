@@ -66,6 +66,15 @@ var typeEncoding = map[string]string{
 	// "}": "", // C Struct End
 }
 
+var swiftBuiltinTypeAlias = map[string]string{
+	"Si": "id /* Swift.Int */",
+	"Su": "id /* Swift.UInt */",
+	"Sb": "BOOL /* Swift.Bool */",
+	"SS": "NSString * /* Swift.String */",
+	"Sf": "id /* Swift.Float */",
+	"Sd": "id /* Swift.Double */",
+}
+
 var typeSpecifiers = map[string]string{
 	"+": "/* gnu register */", // TODO: review
 	"A": "_Atomic",
@@ -164,7 +173,7 @@ func getMethodWithArgs(method, returnType string, args []string) string {
 
 	parts := strings.Split(method, ":")
 
-	var methodStr string
+	var methodStr strings.Builder
 	if len(parts) > 1 { // method has arguments based on SEL having ':'
 		for idx, part := range parts {
 			argName := getLastCapitalizedPart(part)
@@ -174,9 +183,9 @@ func getMethodWithArgs(method, returnType string, args []string) string {
 			if len(part) == 0 || idx >= len(args) {
 				break
 			}
-			methodStr += fmt.Sprintf("%s:%s ", part, args[idx]+argName)
+			methodStr.WriteString(fmt.Sprintf("%s:%s ", part, args[idx]+argName))
 		}
-		return fmt.Sprintf("(%s)%s;", returnType, strings.TrimSpace(methodStr))
+		return fmt.Sprintf("(%s)%s;", returnType, strings.TrimSpace(methodStr.String()))
 	}
 	// method has no arguments based on SEL not having ':'
 	return fmt.Sprintf("(%s)%s;", returnType, method)
@@ -303,6 +312,13 @@ func decodeType(encType string) string {
 	if typ, ok := typeEncoding[encType]; ok {
 		return typ
 	}
+	if alias, ok := swiftBuiltinTypeAlias[encType]; ok {
+		return alias
+	}
+	if strings.HasPrefix(encType, "@\"SwiftUnresolved_0x") {
+		addr := strings.TrimSuffix(strings.TrimPrefix(encType, "@\"SwiftUnresolved_"), "\"")
+		return fmt.Sprintf("id /* Swift metadata %s */", addr)
+	}
 
 	if strings.HasPrefix(encType, "^") {
 		if typ, ok := typeEncoding[encType]; ok {
@@ -338,26 +354,51 @@ func decodeType(encType string) string {
 	if len(encType) > 2 {
 		switch encType[0] {
 		case '!': // VECTOR
-			inner := encType[strings.IndexByte(encType, '[')+1 : strings.LastIndexByte(encType, ']')]
+			start := strings.IndexByte(encType, '[')
+			end := strings.LastIndexByte(encType, ']')
+			if start == -1 || end == -1 || start+1 > end {
+				return encType
+			}
+			inner := encType[start+1 : end]
 			s += decodeVector(inner)
 
 		case '(': // UNION
-			inner := encType[strings.IndexByte(encType, '(')+1 : strings.LastIndexByte(encType, ')')]
+			start := strings.IndexByte(encType, '(')
+			end := strings.LastIndexByte(encType, ')')
+			if start == -1 || end == -1 || start+1 > end {
+				return encType
+			}
+			inner := encType[start+1 : end]
 			s += decodeUnion(inner)
 
 		case '[': // ARRAY
-			inner := encType[strings.IndexByte(encType, '[')+1 : strings.LastIndexByte(encType, ']')]
+			start := strings.IndexByte(encType, '[')
+			end := strings.LastIndexByte(encType, ']')
+			if start == -1 || end == -1 || start+1 > end {
+				return encType
+			}
+			inner := encType[start+1 : end]
 			s += decodeArray(inner)
 
 		case '{': // STRUCT
 			if !(strings.Contains(encType, "{") && strings.Contains(encType, "}")) {
 				return "?"
 			}
-			inner := encType[strings.IndexByte(encType, '{')+1 : strings.LastIndexByte(encType, '}')]
+			start := strings.IndexByte(encType, '{')
+			end := strings.LastIndexByte(encType, '}')
+			if start == -1 || end == -1 || start+1 > end {
+				return encType
+			}
+			inner := encType[start+1 : end]
 			s += decodeStructure(inner)
 
 		case '<': // block func prototype
-			inner := encType[strings.IndexByte(encType, '<')+1 : strings.LastIndexByte(encType, '>')]
+			start := strings.IndexByte(encType, '<')
+			end := strings.LastIndexByte(encType, '>')
+			if start == -1 || end == -1 || start+1 > end {
+				return encType
+			}
+			inner := encType[start+1 : end]
 			ret, args := decodeMethodTypes(inner)
 			s += fmt.Sprintf("(%s (^)(%s))", ret, strings.Join(args, " "))
 		}
@@ -419,12 +460,40 @@ func decodeVector(vectorType string) string {
 
 func decodeBitfield(bitfield string) string {
 	span := encodingGetSizeOfArguments(bitfield)
-	return fmt.Sprintf("unsigned int x:%d", span)
+	return formatBitfieldDecl("x", span)
+}
+
+const (
+	bitfieldWidthUnsignedInt      uint = 32
+	bitfieldWidthUnsignedLongLong uint = 64
+	bitfieldWidthUnsignedInt128   uint = 128
+)
+
+func bitfieldTypeForSpan(span uint) (string, uint) {
+	switch {
+	case span <= bitfieldWidthUnsignedInt:
+		return "unsigned int", span
+	case span <= bitfieldWidthUnsignedLongLong:
+		return "unsigned long long", span
+	case span <= bitfieldWidthUnsignedInt128:
+		return "unsigned __int128", span
+	default:
+		return "unsigned __int128", bitfieldWidthUnsignedInt128
+	}
+}
+
+func formatBitfieldDecl(name string, span uint) string {
+	typ, effectiveSpan := bitfieldTypeForSpan(span)
+	decl := fmt.Sprintf("%s %s:%d", typ, name, effectiveSpan)
+	if effectiveSpan != span {
+		decl += fmt.Sprintf(" /* unsupported bitfield width %d */", span)
+	}
+	return decl
 }
 
 func getFieldName(field string) (string, string) {
-	if strings.HasPrefix(field, "\"") {
-		name, rest, ok := strings.Cut(strings.TrimPrefix(field, "\""), "\"")
+	if after, ok := strings.CutPrefix(field, "\""); ok {
+		name, rest, ok := strings.Cut(after, "\"")
 		if !ok {
 			return "", field
 		}
@@ -475,7 +544,7 @@ func decodeStructOrUnion(typ, kind string) string {
 
 		if strings.HasPrefix(field, "b") {
 			span := encodingGetSizeOfArguments(field)
-			fields = append(fields, fmt.Sprintf("unsigned int %s:%d;", fieldName, span))
+			fields = append(fields, formatBitfieldDecl(fieldName, span)+";")
 		} else if strings.HasPrefix(field, "[") {
 			array := decodeType(field)
 			array = strings.TrimSpace(strings.Replace(array, "x", fieldName, 1)) + ";"
@@ -511,9 +580,15 @@ func decodeStructOrUnion(typ, kind string) string {
 }
 
 func skipFirstType(typStr string) string {
+	if len(typStr) == 0 {
+		return ""
+	}
 	i := 0
 	typ := []byte(typStr)
 	for {
+		if i >= len(typ) {
+			return ""
+		}
 		switch typ[i] {
 		case '+': /* gnu register */
 			fallthrough
@@ -544,36 +619,72 @@ func skipFirstType(typStr string) string {
 				i++ /* Blocks */
 			} else if i+1 < len(typ) && typ[i+1] == '"' {
 				i++
-				for typ[i+1] != '"' {
+				for i+1 < len(typ) && typ[i+1] != '"' {
 					i++ /* Class */
 				}
 				i++
 			}
-			return string(typ[i+1:])
+			if i+1 <= len(typ) {
+				return string(typ[i+1:])
+			}
+			return ""
 		case '!': /* vectors */
 			i += 2
-			for typ[i] == ',' || typ[i] >= '0' && typ[i] <= '9' {
+			for i < len(typ) && (typ[i] == ',' || typ[i] >= '0' && typ[i] <= '9') {
 				i++
 			}
-			return string(typ[i+subtypeUntil(string(typ[i:]), ']')+1:])
+			if i < len(typ) {
+				skip := subtypeUntil(string(typ[i:]), ']')
+				if i+skip+1 <= len(typ) {
+					return string(typ[i+skip+1:])
+				}
+			}
+			return ""
 		case '[': /* arrays */
 			i++
-			for typ[i] >= '0' && typ[i] <= '9' {
+			for i < len(typ) && typ[i] >= '0' && typ[i] <= '9' {
 				i++
 			}
-			return string(typ[i+subtypeUntil(string(typ[i:]), ']')+1:])
+			if i < len(typ) {
+				skip := subtypeUntil(string(typ[i:]), ']')
+				if i+skip+1 <= len(typ) {
+					return string(typ[i+skip+1:])
+				}
+			}
+			return ""
 		case '{': /* structures */
 			i++
-			return string(typ[i+subtypeUntil(string(typ[i:]), '}')+1:])
+			if i < len(typ) {
+				skip := subtypeUntil(string(typ[i:]), '}')
+				if i+skip+1 <= len(typ) {
+					return string(typ[i+skip+1:])
+				}
+			}
+			return ""
 		case '(': /* unions */
 			i++
-			return string(typ[i+subtypeUntil(string(typ[i:]), ')')+1:])
+			if i < len(typ) {
+				skip := subtypeUntil(string(typ[i:]), ')')
+				if i+skip+1 <= len(typ) {
+					return string(typ[i+skip+1:])
+				}
+			}
+			return ""
 		case '<': /* block func prototype */
 			i++
-			return string(typ[i+subtypeUntil(string(typ[i:]), '>')+1:])
+			if i < len(typ) {
+				skip := subtypeUntil(string(typ[i:]), '>')
+				if i+skip+1 <= len(typ) {
+					return string(typ[i+skip+1:])
+				}
+			}
+			return ""
 		default: /* basic types */
 			i++
-			return string(typ[i:])
+			if i <= len(typ) {
+				return string(typ[i:])
+			}
+			return ""
 		}
 	}
 }
@@ -608,6 +719,9 @@ func CutType(typStr string) (string, string, bool) {
 
 	typ := []byte(typStr)
 	for {
+		if i >= len(typ) {
+			return "", string(typ[1:]), false
+		}
 		switch typ[i] {
 		case '+': /* gnu register */
 			fallthrough

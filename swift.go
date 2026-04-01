@@ -11,6 +11,8 @@ import (
 	"strings"
 	"unicode"
 
+	swiftpkg "github.com/blacktop/go-macho/pkg/swift"
+	"github.com/blacktop/go-macho/types"
 	"github.com/blacktop/go-macho/types/swift"
 )
 
@@ -18,6 +20,8 @@ const sizeOfInt32 = 4
 const sizeOfInt64 = 8
 
 var ErrSwiftSectionError = fmt.Errorf("missing swift section")
+var errSwiftUnsupportedSymbolicReference = errors.New("unsupported swift symbolic reference")
+var errSwiftSymbolicControlDataDecode = errors.New("swift symbolic control-data decode failed")
 
 // HasSwift checks if the MachO has swift info
 func (f *File) HasSwift() bool {
@@ -554,7 +558,7 @@ func (f *File) GetSwiftDynamicReplacementInfoForOpaqueTypes() (*swift.AutomaticD
 }
 
 // GetSwiftAccessibleFunctions parses the __TEXT.__swift5_acfuncs section
-func (f *File) GetSwiftAccessibleFunctions() (funcs []swift.TargetAccessibleFunctionRecord, err error) {
+func (f *File) GetSwiftAccessibleFunctions() (funcs []swift.AccessibleFunction, err error) {
 	if sec := f.Section("__TEXT", "__swift5_acfuncs"); sec != nil {
 		off, err := f.vma.GetOffset(f.vma.Convert(sec.Addr))
 		if err != nil {
@@ -578,7 +582,41 @@ func (f *File) GetSwiftAccessibleFunctions() (funcs []swift.TargetAccessibleFunc
 				}
 				return nil, fmt.Errorf("failed to read swift %T: %w", afr, err)
 			}
-			funcs = append(funcs, afr)
+
+			name := ""
+			if afr.Name.IsSet() {
+				if s, err := f.GetCString(afr.Name.GetAddress()); err == nil {
+					name = f.demangleSwiftString(s)
+				} else {
+					name = fmt.Sprintf("(name %#x)", afr.Name.GetAddress())
+				}
+			}
+
+			functionType := ""
+			if afr.FunctionType.IsSet() {
+				if s, err := f.makeSymbolicMangledNameStringRef(afr.FunctionType.GetAddress()); err == nil {
+					functionType = f.demangleSwiftString(s)
+				} else if raw, err := f.GetCString(afr.FunctionType.GetAddress()); err == nil {
+					functionType = f.demangleSwiftString(raw)
+				} else {
+					functionType = fmt.Sprintf("(type %#x)", afr.FunctionType.GetAddress())
+				}
+			}
+
+			fnAddr := afr.Function.GetAddress()
+			if f.vma != nil {
+				if converted := f.vma.Convert(fnAddr); converted != 0 {
+					fnAddr = converted
+				}
+			}
+
+			funcs = append(funcs, swift.AccessibleFunction{
+				Name:               name,
+				FunctionType:       functionType,
+				FunctionAddress:    fnAddr,
+				GenericEnvironment: afr.GenericEnvironment.GetAddress(),
+				Flags:              afr.Flags,
+			})
 		}
 
 		return funcs, nil
@@ -587,44 +625,102 @@ func (f *File) GetSwiftAccessibleFunctions() (funcs []swift.TargetAccessibleFunc
 	return nil, fmt.Errorf("MachO has no '__swift5_acfuncs' section: %w", ErrSwiftSectionError)
 }
 
-// TODO: With the improvements to makeSymbolicMangledNameStringRef I believe I can NOW add this back in and add it to `PreCache()`
-//// GetSwiftTypeRefs parses all the type references in the __TEXT.__swift5_typeref section
-// func (f *File) GetSwiftTypeRefs() (trefs map[uint64]string, err error) {
-// 	trefs = make(map[uint64]string)
+// GetSwiftTypeRefs parses all the type references in the __TEXT.__swift5_typeref section.
+func (f *File) GetSwiftTypeRefs() (trefs map[uint64]string, err error) {
+	trefs = make(map[uint64]string)
 
-// 	if sec := f.Section("__TEXT", "__swift5_typeref"); sec != nil {
-// 		off, err := f.vma.GetOffset(f.vma.Convert(sec.Addr))
-// 		if err != nil {
-// 			return nil, fmt.Errorf("failed to convert vmaddr: %v", err)
-// 		}
-// 		f.cr.Seek(int64(off), io.SeekStart)
+	if sec := f.Section("__TEXT", "__swift5_typeref"); sec != nil {
+		addr := sec.Addr
+		remaining := sec.Size
 
-// 		dat := make([]byte, sec.Size)
-// 		if err := binary.Read(f.cr, f.ByteOrder, dat); err != nil {
-// 			return nil, fmt.Errorf("failed to read %s.%s data: %v", sec.Seg, sec.Name, err)
-// 		}
+		for remaining > 0 {
+			recordSize, hasData, err := f.swiftTypeRefRecordSize(addr, remaining)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse swift typeref record @ %#x: %w", addr, err)
+			}
+			if recordSize == 0 {
+				return nil, fmt.Errorf("swift typeref record @ %#x has zero size", addr)
+			}
 
-// 		r := bytes.NewReader(dat)
+			if hasData {
+				typ, err := f.makeSymbolicMangledNameStringRef(addr)
+				if err != nil {
+					if errors.Is(err, errSwiftSymbolicControlDataDecode) {
+						return nil, fmt.Errorf("failed to read swift typeref @ %#x: %w", addr, err)
+					}
+					if fallback, fbErr := f.swiftSymbolicName(addr); fbErr == nil {
+						typ = fallback
+					} else if cstr, cErr := f.GetCString(addr); cErr == nil {
+						typ = cstr
+					} else {
+						typ = fmt.Sprintf("(typeref %#x)", addr)
+					}
+				}
+				trefs[addr] = typ
+			}
 
-// 		for {
-// 			curr, _ := r.Seek(0, io.SeekCurrent)
+			addr += recordSize
+			remaining -= recordSize
+		}
 
-// 			typ, err := f.makeSymbolicMangledNameStringRef(sec.Addr + uint64(curr))
-// 			if err != nil {
-// 				if errors.Is(err, io.EOF) {
-// 					break
-// 				}
-// 				return nil, fmt.Errorf("failed to read swift AssociatedTypeDescriptor: %w", err)
-// 			}
+		return trefs, nil
+	}
 
-// 			trefs[sec.Addr+uint64(curr)] = typ
-// 		}
+	return nil, fmt.Errorf("MachO has no '__swift5_typeref' section: %w", ErrSwiftSectionError)
+}
 
-// 		return trefs, nil
-// 	}
+func (f *File) swiftTypeRefRecordSize(addr, maxSize uint64) (uint64, bool, error) {
+	if maxSize == 0 {
+		return 0, false, io.EOF
+	}
 
-// 	return nil, fmt.Errorf("MachO has no '__swift5_typeref' section: %w", ErrSwiftSectionError)
-// }
+	if err := f.cr.SeekToAddr(addr); err != nil {
+		return 0, false, fmt.Errorf("failed to seek to swift typeref record @ %#x: %w", addr, err)
+	}
+
+	var size uint64
+	var hasData bool
+	b := make([]byte, 1)
+
+	for size < maxSize {
+		if _, err := f.cr.Read(b); err != nil {
+			return 0, false, fmt.Errorf("failed to read swift typeref record @ %#x: %w", addr+size, err)
+		}
+		size++
+
+		switch {
+		case b[0] == 0xff:
+			continue
+		case b[0] == 0:
+			return size, hasData, nil
+		case b[0] >= 0x01 && b[0] <= 0x17:
+			hasData = true
+			payloadSize := uint64(binary.Size(int32(0)))
+			if size+payloadSize > maxSize {
+				return 0, false, fmt.Errorf("truncated relative symbolic reference payload")
+			}
+			if _, err := io.CopyN(io.Discard, f.cr, int64(payloadSize)); err != nil {
+				return 0, false, fmt.Errorf("failed to skip relative symbolic reference payload: %w", err)
+			}
+			size += payloadSize
+		case b[0] >= 0x18 && b[0] <= 0x1f:
+			hasData = true
+			// Keep payload width aligned with makeSymbolicMangledNameStringRef.
+			payloadSize := uint64(binary.Size(uint64(0)))
+			if size+payloadSize > maxSize {
+				return 0, false, fmt.Errorf("truncated absolute symbolic reference payload")
+			}
+			if _, err := io.CopyN(io.Discard, f.cr, int64(payloadSize)); err != nil {
+				return 0, false, fmt.Errorf("failed to skip absolute symbolic reference payload: %w", err)
+			}
+			size += payloadSize
+		default:
+			hasData = true
+		}
+	}
+
+	return 0, false, fmt.Errorf("unterminated swift typeref record")
+}
 
 // GetSwiftMultiPayloadEnums TODO: finish me
 func (f *File) GetSwiftMultiPayloadEnums() (mpenums []swift.MultiPayloadEnum, err error) {
@@ -1216,6 +1312,10 @@ func (f *File) readProtocolConformance(r io.ReadSeeker, addr uint64) (pcd *swift
 		var rwit swift.TargetResilientWitnessesHeader
 		if err := binary.Read(r, f.ByteOrder, &rwit); err != nil {
 			return nil, fmt.Errorf("failed to read resilient witnesses offset: %v", err)
+		}
+		const maxResilientWitnesses = 65536
+		if rwit.NumWitnesses > maxResilientWitnesses {
+			return nil, fmt.Errorf("implausible witness count %d", rwit.NumWitnesses)
 		}
 		pcd.ResilientWitnesses = make([]swift.ResilientWitnesses, rwit.NumWitnesses)
 		for i := 0; i < int(rwit.NumWitnesses); i++ {
@@ -2369,11 +2469,11 @@ func (f *File) getTypeImportInfo(addr uint64) (string, error) {
 		}
 	}
 
-	var out string
+	var out strings.Builder
 	for _, s := range parts {
 		switch {
 		case strings.HasPrefix(s, ABIName):
-			out += strings.TrimPrefix(s, string(ABIName))
+			out.WriteString(strings.TrimPrefix(s, string(ABIName)))
 		case strings.HasPrefix(s, SymbolNamespace):
 			namespace := strings.TrimPrefix(s, string(SymbolNamespace))
 			if namespace != CTypedef {
@@ -2387,7 +2487,7 @@ func (f *File) getTypeImportInfo(addr uint64) (string, error) {
 		}
 	}
 
-	return out, nil
+	return out.String(), nil
 }
 
 func (f *File) getAssociatedTypes(addr uint64) ([]string, error) {
@@ -2436,6 +2536,93 @@ func (f *File) symbolLookup(addr uint64) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("failed to find symbol for address %#x", addr)
+}
+
+func normalizeObjCProtocolSymbol(name string) string {
+	switch {
+	case strings.HasPrefix(name, "_OBJC_PROTOCOL_$_"):
+		return strings.TrimPrefix(name, "_OBJC_PROTOCOL_$_")
+	case strings.HasPrefix(name, "_OBJC_LABEL_PROTOCOL_$_"):
+		return strings.TrimPrefix(name, "_OBJC_LABEL_PROTOCOL_$_")
+	case strings.HasPrefix(name, "_OBJC_PROTOCOL_REFERENCE_$_"):
+		return strings.TrimPrefix(name, "_OBJC_PROTOCOL_REFERENCE_$_")
+	default:
+		return name
+	}
+}
+
+func (f *File) objcProtocolSymbolicName(addr uint64) (string, error) {
+	candidates := make([]uint64, 0, 4)
+	seen := make(map[uint64]struct{})
+	addCandidate := func(candidate uint64) {
+		if candidate == 0 {
+			return
+		}
+		if _, ok := seen[candidate]; ok {
+			return
+		}
+		seen[candidate] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+
+	addCandidate(addr)
+	if f.vma != nil {
+		addCandidate(f.vma.Convert(addr))
+	}
+	if ptr, err := f.GetPointerAtAddress(addr); err == nil {
+		addCandidate(ptr)
+	}
+
+	for _, candidate := range candidates {
+		if bind, err := f.GetBindName(candidate); err == nil {
+			name := normalizeObjCProtocolSymbol(bind)
+			if len(name) > 0 {
+				return name, nil
+			}
+		}
+
+		if syms, err := f.FindAddressSymbols(candidate); err == nil {
+			for _, s := range syms {
+				if s.Type.IsDebugSym() {
+					continue
+				}
+				name := normalizeObjCProtocolSymbol(s.Name)
+				if len(name) > 0 {
+					return name, nil
+				}
+			}
+		}
+
+		if name, err := f.objcProtocolNameAtAddress(candidate); err == nil && len(name) > 0 {
+			return name, nil
+		}
+
+		if cstr, err := f.GetCString(candidate); err == nil && len(cstr) > 0 && isPrintableASCII(cstr) {
+			return cstr, nil
+		}
+	}
+
+	return "", fmt.Errorf("failed to resolve objective-c protocol symbolic ref at %#x", addr)
+}
+
+func (f *File) objcProtocolNameAtAddress(addr uint64) (string, error) {
+	if f.pointerSize() != sizeOfInt64 {
+		return "", fmt.Errorf("unsupported pointer size %d for objc protocol name resolution", f.pointerSize())
+	}
+
+	namePtr, err := f.GetPointerAtAddress(addr + sizeOfInt64)
+	if err != nil {
+		return "", fmt.Errorf("failed to read objc protocol name pointer @ %#x: %w", addr+sizeOfInt64, err)
+	}
+	if namePtr == 0 {
+		return "", fmt.Errorf("objc protocol name pointer is null @ %#x", addr+sizeOfInt64)
+	}
+
+	name, err := f.GetCString(namePtr)
+	if err != nil {
+		return "", fmt.Errorf("failed to read objc protocol name @ %#x: %w", namePtr, err)
+	}
+	return name, nil
 }
 
 func (f *File) getContextDesc(addr uint64) (ctx *swift.TargetModuleContext, err error) {
@@ -2500,6 +2687,281 @@ func (f *File) getContextDesc(addr uint64) (ctx *swift.TargetModuleContext, err 
 	return ctx, nil
 }
 
+func (f *File) swiftSymbolicName(addr uint64) (string, error) {
+	if f.cr == nil {
+		return "", fmt.Errorf("reader does not support ReadAtAddr for swift symbolic references")
+	}
+	reader := f.cr
+
+	header := make([]byte, 8)
+	n, err := reader.ReadAtAddr(header, addr)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("failed to read swift symbolic reference header at %#x: %w", addr, err)
+	}
+	if n < len(header) {
+		return "", fmt.Errorf("swift symbolic reference header truncated at %#x", addr)
+	}
+
+	offset := int32(f.ByteOrder.Uint32(header[0:4]))
+	flags := f.ByteOrder.Uint32(header[4:8])
+
+	var (
+		target          uint64
+		canSymbolically bool
+	)
+	switch {
+	case offset == 0:
+		target = addr + 8
+		canSymbolically = true
+	case offset != 0:
+		target = uint64(int64(addr) + int64(offset))
+		canSymbolically = true
+	}
+
+	if canSymbolically {
+		name, err := f.makeSymbolicMangledNameStringRef(target)
+		if err == nil {
+			return name, nil
+		}
+		if fallback, fbErr := f.swiftFallbackSymbolicName(reader, addr, offset, flags); fbErr == nil {
+			return fallback, nil
+		}
+		return "", err
+	}
+
+	if fallback, fbErr := f.swiftFallbackSymbolicName(reader, addr, offset, flags); fbErr == nil {
+		return fallback, nil
+	}
+
+	return "", fmt.Errorf("swift symbolic reference offset %d out of expected range", offset)
+}
+
+func isPrintableASCII(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func collectSwiftStrings(reader types.MachoReader, addr uint64, max int) ([]string, error) {
+	buf := make([]byte, max)
+	n, err := reader.ReadAtAddr(buf, addr)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	buf = buf[:n]
+
+	var parts []string
+	i := 0
+	for i < len(buf) {
+		for i < len(buf) && buf[i] == 0 {
+			i++
+		}
+		if i >= len(buf) {
+			break
+		}
+		j := i
+		for j < len(buf) && buf[j] != 0 {
+			j++
+		}
+		if j > i {
+			parts = append(parts, string(buf[i:j]))
+		}
+		i = j + 1
+	}
+	return parts, nil
+}
+
+func normalizeSwiftMangling(s string) string {
+	switch {
+	case strings.HasPrefix(s, "_$s"), strings.HasPrefix(s, "_T"):
+		return s
+	case strings.HasPrefix(s, "$s"):
+		return "_" + s
+	default:
+		return s
+	}
+}
+
+func swiftStringScore(s string) int {
+	switch {
+	case strings.HasPrefix(s, "_TtC"), strings.HasPrefix(s, "_TtV"), strings.HasPrefix(s, "_TtO"), strings.HasPrefix(s, "_TtP"):
+		return 5
+	case strings.HasPrefix(s, "_Tt"):
+		return 4
+	case strings.HasPrefix(s, "_$s"):
+		return 1
+	default:
+		return 0
+	}
+}
+
+func swiftAsciiScore(s string) int {
+	score := 1
+	if strings.Contains(s, ".") {
+		score = 4
+		if strings.ContainsAny(s, " \t") {
+			score = 2
+		}
+	}
+	return score
+}
+
+func selectSwiftString(parts []string, reverse bool) (string, bool) {
+	var ordered []string
+	if reverse {
+		ordered = make([]string, len(parts))
+		for i := range parts {
+			ordered[i] = parts[len(parts)-1-i]
+		}
+	} else {
+		ordered = append(ordered, parts...)
+	}
+
+	bestScore := -1
+	best := ""
+	update := func(candidate string, score int) {
+		if len(candidate) == 0 {
+			return
+		}
+		if score > bestScore || (score == bestScore && len(candidate) > len(best)) {
+			bestScore = score
+			best = candidate
+		}
+	}
+
+	// prefer mangled tokens
+	for _, part := range ordered {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "_T") || strings.HasPrefix(part, "$s") {
+			normalized := normalizeSwiftMangling(part)
+			update(normalized, swiftStringScore(normalized))
+		}
+	}
+
+	// fall back to printable ASCII, still preferring the longest segment
+	for _, part := range ordered {
+		part = strings.TrimSpace(part)
+		if len(part) == 0 {
+			continue
+		}
+		if isPrintableASCII(part) {
+			normalized := normalizeSwiftMangling(part)
+			update(normalized, swiftAsciiScore(normalized))
+		}
+	}
+
+	if len(best) > 0 {
+		return best, true
+	}
+
+	return "", false
+}
+
+func selectSwiftStringFromJoined(parts []string) (string, bool) {
+	if len(parts) == 0 {
+		return "", false
+	}
+	joined := strings.Join(parts, "\x00")
+
+	bestScore := -1
+	best := ""
+	update := func(candidate string, score int) {
+		if len(candidate) == 0 {
+			return
+		}
+		if score > bestScore || (score == bestScore && len(candidate) > len(best)) {
+			bestScore = score
+			best = candidate
+		}
+	}
+
+	if idx := strings.Index(joined, "_T"); idx >= 0 {
+		end := idx
+		for end < len(joined) && joined[end] != 0 {
+			end++
+		}
+		normalized := normalizeSwiftMangling(joined[idx:end])
+		update(normalized, swiftStringScore(normalized))
+	}
+	if idx := strings.Index(joined, "$s"); idx >= 0 {
+		end := idx
+		for end < len(joined) && joined[end] != 0 {
+			end++
+		}
+		normalized := normalizeSwiftMangling(joined[idx:end])
+		update(normalized, swiftStringScore(normalized))
+	}
+	if found := strings.Contains(joined, "."); found {
+		// handle ASCII forms like Module.Type
+		parts := strings.Split(joined, "\x00")
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if isPrintableASCII(trimmed) {
+				normalized := normalizeSwiftMangling(trimmed)
+				update(normalized, swiftAsciiScore(normalized))
+			}
+		}
+	}
+	if len(best) > 0 {
+		return best, true
+	}
+	return "", false
+}
+
+func (f *File) swiftFallbackSymbolicName(reader types.MachoReader, addr uint64, offset int32, flags uint32) (string, error) {
+	const readLimit = 0x1000
+
+	if offset != 0 {
+		target := uint64(int64(addr) + int64(offset))
+		parts, err := collectSwiftStrings(reader, target, readLimit)
+		if err != nil {
+			return "", err
+		}
+		if candidate, ok := selectSwiftString(parts, false); ok {
+			return candidate, nil
+		}
+		return "", fmt.Errorf("swift relative string at %#x not printable", target)
+	}
+
+	if offset == 0 {
+		if flags != 0 && flags != 1 {
+			if flags&0xffff0000 != 0 {
+				return "", fmt.Errorf("unexpected swift inline flags %#x", flags)
+			}
+		}
+		parts, err := collectSwiftStrings(reader, addr+8, readLimit)
+		if err == nil {
+			if candidate, ok := selectSwiftString(parts, true); ok {
+				return candidate, nil
+			}
+			if candidate, ok := selectSwiftString(parts, false); ok {
+				return candidate, nil
+			}
+		}
+	}
+
+	parts, err := collectSwiftStrings(reader, addr, readLimit)
+	if err != nil {
+		return "", err
+	}
+	if candidate, ok := selectSwiftString(parts, true); ok {
+		return candidate, nil
+	}
+	if candidate, ok := selectSwiftString(parts, false); ok {
+		return candidate, nil
+	}
+	if candidate, ok := selectSwiftStringFromJoined(parts); ok {
+		return candidate, nil
+	}
+	return "", fmt.Errorf("swift metadata at %#x not printable", addr)
+}
+
 // ref: https://github.com/apple/swift/blob/main/lib/Demangling/Demangler.cpp (demangleSymbolicReference)
 // ref: https://github.com/apple/swift/blob/main/docs/ABI/Mangling.rst#symbolic-references
 func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
@@ -2519,12 +2981,12 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 
 		seqData := make([]uint8, 1)
 		if err := f.cr.SeekToAddr(addr); err != nil {
-			return nil, fmt.Errorf("failed to seek to swift symbolic mangled name control data addr: %w", err)
+			return nil, fmt.Errorf("%w: failed to seek to swift symbolic mangled name control data addr: %w", errSwiftSymbolicControlDataDecode, err)
 		}
 		off, _ := f.cr.Seek(0, io.SeekCurrent)
 		curr, _ = f.cr.Seek(0, io.SeekCurrent)
 		if _, err := f.cr.Read(seqData); err != nil {
-			return nil, fmt.Errorf("failed to read to swift symbolic mangled name control data: %v", err)
+			return nil, fmt.Errorf("%w: failed to read swift symbolic mangled name control data: %w", errSwiftSymbolicControlDataDecode, err)
 		}
 
 		for {
@@ -2545,7 +3007,7 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 				rawKind = seqData[0]
 				var reference int32
 				if err := binary.Read(f.cr, f.ByteOrder, &reference); err != nil {
-					return nil, fmt.Errorf("failed to read swift symbolic reference: %v", err)
+					return nil, fmt.Errorf("%w: failed to read swift symbolic reference: %w", errSwiftSymbolicControlDataDecode, err)
 				}
 				elements = append(elements, lookup{
 					Kind: seqData[0],
@@ -2559,7 +3021,7 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 				// symbolic = true
 				var reference uint64
 				if err := binary.Read(f.cr, f.ByteOrder, &reference); err != nil {
-					return nil, fmt.Errorf("failed to read swift symbolic reference: %v", err)
+					return nil, fmt.Errorf("%w: failed to read swift symbolic reference: %w", errSwiftSymbolicControlDataDecode, err)
 				}
 				elements = append(elements, lookup{
 					Kind: seqData[0],
@@ -2575,7 +3037,7 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 				if err == io.EOF {
 					break
 				}
-				return nil, fmt.Errorf("failed to read swift symbolic reference control data: %v", err)
+				return nil, fmt.Errorf("%w: failed to read swift symbolic reference control data: %w", errSwiftSymbolicControlDataDecode, err)
 			}
 		}
 		return elements, nil
@@ -2583,7 +3045,7 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 
 	parts, err := parseControlData()
 	if err != nil {
-		return "", fmt.Errorf("failed to parse control data: %v", err)
+		return "", fmt.Errorf("failed to parse control data: %w", err)
 	}
 
 	var isBoundGeneric bool
@@ -2751,8 +3213,12 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 				out = append(out, name)
 			case 0x0c: // DIRECT symbolic reference to a objective C protocol ref.
 				// ObjectiveCProtocol
-				return "", fmt.Errorf("symbolic reference to a objective C protocol ref kind %x (at %#x) is not implemented (please open an issue on Github)", part.Kind, part.Addr)
-			/* These are all currently reserved but unused. */
+				name, err := f.objcProtocolSymbolicName(part.Addr)
+				if err != nil {
+					name = fmt.Sprintf("(objc_protocol %#x)", part.Addr)
+				}
+				out = append(out, name)
+				/* These are all currently reserved but unused. */
 			case 0x03: // DIRECT to protocol conformance descriptor
 				fallthrough
 			case 0x04: // indirect to protocol conformance descriptor
@@ -2766,7 +3232,7 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 			case 0x08: // indirect to associated conformance access function
 				fallthrough
 			default:
-				return "", fmt.Errorf("symbolic reference control character %#x is not implemented", rawKind)
+				return "", fmt.Errorf("%w control character %#x", errSwiftUnsupportedSymbolicReference, rawKind)
 			}
 		default:
 			return "", fmt.Errorf("unexpected symbolic reference element type %#v", part)
@@ -2774,4 +3240,37 @@ func (f *File) makeSymbolicMangledNameStringRef(addr uint64) (string, error) {
 	}
 
 	return strings.Join(out, " "), nil
+}
+
+func (f *File) demangleSwiftString(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return input
+	}
+	if mapped, ok := swiftSpecialTypeTokens[trimmed]; ok {
+		return mapped
+	}
+	if !f.swiftAutoDemangle {
+		return trimmed
+	}
+	if out, err := swiftpkg.Demangle(trimmed); err == nil && out != "" {
+		return out
+	}
+	return swiftpkg.NormalizeIdentifier(trimmed)
+}
+
+func (f *File) normalizeSwiftIdentifier(name string) string {
+	if name == "" {
+		return name
+	}
+	if !f.swiftAutoDemangle {
+		return name
+	}
+	return swiftpkg.NormalizeIdentifier(name)
+}
+
+var swiftSpecialTypeTokens = map[string]string{
+	"_$sXDXMT": "@thick Self.Type",
+	"$sXDXMT":  "@thick Self.Type",
+	"XDXMT":    "@thick Self.Type",
 }

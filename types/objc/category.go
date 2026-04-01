@@ -3,6 +3,7 @@ package objc
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -73,13 +74,17 @@ func (c *Category) dump(verbose, addrs bool) string {
 				continue
 			}
 			if verbose {
+				if meth.Types == "" {
+					slog.Warn("category class method has empty type encoding", "method", meth.Name, "category", c.Name, "typesVMAddr", meth.TypesVMAddr)
+					continue
+				}
 				rtype, args := decodeMethodTypes(meth.Types)
 				if addrs {
 					s.WriteString(fmt.Sprintf("// %#x\n", meth.ImpVMAddr))
 				}
 				s.WriteString(fmt.Sprintf("+ %s\n", getMethodWithArgs(meth.Name, rtype, args)))
 			} else {
-				s.WriteString(fmt.Sprintf("-[%s %s];\n", c.Name, meth.Name))
+				s.WriteString(fmt.Sprintf("+[%s %s];\n", className, meth.Name))
 			}
 		}
 		cMethods = s.String()
@@ -94,13 +99,17 @@ func (c *Category) dump(verbose, addrs bool) string {
 				continue
 			}
 			if verbose {
+				if meth.Types == "" {
+					slog.Warn("category instance method has empty type encoding", "method", meth.Name, "category", c.Name, "typesVMAddr", meth.TypesVMAddr)
+					continue
+				}
 				rtype, args := decodeMethodTypes(meth.Types)
 				if addrs {
 					s.WriteString(fmt.Sprintf("// %#x\n", meth.ImpVMAddr))
 				}
 				s.WriteString(fmt.Sprintf("- %s\n", getMethodWithArgs(meth.Name, rtype, args)))
 			} else {
-				s.WriteString(fmt.Sprintf("-[%s %s];\n", c.Name, meth.Name))
+				s.WriteString(fmt.Sprintf("-[%s %s];\n", className, meth.Name))
 			}
 		}
 		iMethods = s.String()

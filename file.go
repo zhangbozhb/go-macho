@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf16"
 
 	"github.com/blacktop/go-dwarf"
 
@@ -39,11 +40,24 @@ type File struct {
 	exp         []trie.TrieExport
 	exptrieData []byte
 	binds       types.Binds
-	objc        map[uint64]any
-	swift       map[uint64]any
-	ledata      *bytes.Buffer // tmp storage of linkedit data
+	rebases     []types.Rebase
+	rebasesDone bool
+
+	dyldInfoCacheBuilt    bool
+	dyldInfoRebaseTargets map[uint64]uint64
+	dyldInfoRebaseValues  map[uint64]struct{}
+	dyldInfoBindsByAddr   map[uint64]types.Bind
+
+	objc   map[uint64]any
+	swift  map[uint64]any
+	ledata *bytes.Buffer // tmp storage of linkedit data
+
+	objcRuntimeOnce          sync.Once
+	objcHasNonFragileRuntime bool
+	objcHasFragileRuntime    bool
 
 	sharedCacheRelativeSelectorBaseVMAddress uint64 // objc_opt version 16
+	swiftAutoDemangle                        bool
 
 	mu     sync.Mutex
 	sr     types.MachoReader
@@ -62,6 +76,18 @@ var ErrMachOArchNotSupported = errors.New("MachO arch not supported")
 var ErrMachOSectionNotFound = errors.New("MachO missing required section")
 var ErrMachODyldInfoNotFound = errors.New("LC_DYLD_INFO(_ONLY) not found")
 var ErrMachONoBindInfo = errors.New("MachO does not contain bind information (fixups)")
+
+var ErrCStringNoTerminator = errors.New("cstring has no terminator")
+var ErrCStringNotFound = errors.New("cstring not found")
+
+// cstringBufPool reuses 4 KiB read buffers in GetCString to avoid hammering
+// the allocator's mcentral lock when many goroutines read C strings concurrently.
+var cstringBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0x1000)
+		return &b
+	},
+}
 
 // FormatError is returned by some operations if the data does
 // not have the correct format for an object file.
@@ -137,6 +163,7 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 
 	f.objc = make(map[uint64]any)
 	f.swift = make(map[uint64]any)
+	f.swiftAutoDemangle = true
 
 	f.vma = &types.VMAddrConverter{
 		Converter:    f.convertToVMAddr,
@@ -1281,7 +1308,7 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			if err := binary.Read(b, bo, &led); err != nil {
 				return nil, fmt.Errorf("failed to read LC_FUNCTION_VARIANT_FIXUPS: %v", err)
 			}
-			l := new(FunctionVariants)
+			l := new(FunctionVariantFixups)
 			l.LoadBytes = cmddat
 			l.LoadCmd = cmd
 			l.Len = siz
@@ -1354,10 +1381,11 @@ func NewFile(r io.ReaderAt, config ...FileConfig) (*File, error) {
 			if int64(s.Filesz) < 0 {
 				return nil, &FormatError{offset, "invalid section file size", s.Filesz}
 			}
-			// s.sr = io.NewSectionReader(r, int64(s.Offset), int64(s.Filesz))
+			s.sr = io.NewSectionReader(r, int64(s.Offset), int64(s.Filesz))
 			s.ReaderAt = f.sr
 		}
 	}
+
 	return f, nil
 }
 
@@ -1387,6 +1415,7 @@ func (f *File) parseSymtab(symdat, strtab, cmddat []byte, hdr *types.SymtabCmd, 
 			n.Value = uint64(n32.Value)
 		}
 		var name string
+		var indirectName string
 		if n.Name < uint32(len(strtab)) {
 			// We add "_" to Go symbols. Strip it here. See issue 33808.
 			name = cstring(strtab[n.Name:])
@@ -1394,12 +1423,19 @@ func (f *File) parseSymtab(symdat, strtab, cmddat []byte, hdr *types.SymtabCmd, 
 				name = name[1:]
 			}
 		}
+		if n.Type.IsIndirectSym() && n.Value < uint64(len(strtab)) {
+			indirectName = cstring(strtab[n.Value:])
+			if strings.Contains(indirectName, ".") && indirectName[0] == '_' {
+				indirectName = indirectName[1:]
+			}
+		}
 		symtab = append(symtab, Symbol{
-			Name:  name,
-			Type:  n.Type,
-			Sect:  n.Sect,
-			Desc:  n.Desc,
-			Value: n.Value,
+			Name:         name,
+			IndirectName: indirectName,
+			Type:         n.Type,
+			Sect:         n.Sect,
+			Desc:         n.Desc,
+			Value:        n.Value,
 		})
 	}
 	st := new(Symtab)
@@ -1545,6 +1581,10 @@ func (f *File) ReadAt(p []byte, off int64) (n int, err error) {
 	return f.cr.ReadAt(p, off) // TODO: should this be f.cr  or f.sr?
 }
 
+func (f *File) ReadAtAddr(p []byte, addr uint64) (n int, err error) {
+	return f.cr.ReadAtAddr(p, addr)
+}
+
 // GetOffset returns the file offset for a given virtual address
 func (f *File) GetOffset(address uint64) (uint64, error) {
 	return f.vma.GetOffset(address)
@@ -1580,30 +1620,231 @@ func (f *File) GetBaseAddress() uint64 {
 
 // GetPointer returns pointer at a given offset
 func (f *File) GetPointer(offset uint64) (uint64, error) {
-	if _, err := f.cr.Seek(int64(offset), io.SeekStart); err != nil {
-		return 0, fmt.Errorf("failed to Seek to offset %#x: %v", offset, err)
+	// Thread-safe: Use ReadAt which doesn't modify shared state
+	buf := make([]byte, 8)
+	if _, err := f.cr.ReadAt(buf, int64(offset)); err != nil {
+		return 0, fmt.Errorf("failed to read pointer at offset %#x: %w", offset, err)
 	}
-	var ptr uint64
-	if err := binary.Read(f.cr, binary.LittleEndian, &ptr); err != nil {
-		return 0, fmt.Errorf("failed to read pointer at offset %#x: %v", offset, err)
-	}
+	ptr := f.ByteOrder.Uint64(buf)
+	// CRITICAL: Convert handles pointer sliding/rebasing for relocated pointers
 	return f.vma.Convert(ptr), nil
 }
 
 // GetPointerAtAddress returns pointer at a given virtual address
 func (f *File) GetPointerAtAddress(address uint64) (uint64, error) {
-	if err := f.cr.SeekToAddr(address); err != nil {
-		return 0, fmt.Errorf("failed to Seek to address %#x: %v", address, err)
+	// Thread-safe: Use ReadAtAddr which doesn't modify shared state
+	buf := make([]byte, 8)
+	if _, err := f.cr.ReadAtAddr(buf, address); err != nil {
+		return 0, fmt.Errorf("failed to read pointer @ %#x: %w", address, err)
 	}
-	var ptr uint64
-	if err := binary.Read(f.cr, binary.LittleEndian, &ptr); err != nil {
-		return 0, fmt.Errorf("failed to read pointer @ %#x: %v", address, err)
-	}
+	ptr := f.ByteOrder.Uint64(buf)
+	// CRITICAL: Convert handles pointer sliding/rebasing for relocated pointers
 	return f.vma.Convert(ptr), nil
+}
+
+// ResetFixupsCache clears the cached dyld chained fixups metadata so subsequent
+// lookups will reparse the load command payload.
+func (f *File) ResetFixupsCache() {
+	f.dcf = nil
+	f.binds = nil
+	f.rebases = nil
+	f.rebasesDone = false
+	f.dyldInfoCacheBuilt = false
+	f.dyldInfoRebaseTargets = nil
+	f.dyldInfoRebaseValues = nil
+	f.dyldInfoBindsByAddr = nil
+	if f.vma != nil {
+		f.vma.ChainedPointerFormat = 0
+	}
+}
+
+// GetSlidPointerAtAddress reads the raw pointer at the given virtual address and, if it is a
+// chained rebase pointer, returns the rebased (slid) target using the fast fixup lookup. When the
+// pointer is not part of a chained rebase, the result falls back to SlidePointer behaviour.
+func (f *File) GetSlidPointerAtAddress(address uint64) (uint64, error) {
+	offset, offErr := f.vma.GetOffset(address)
+	var rawBuf [8]byte
+	var raw uint64
+	var rawRead bool
+
+	if offErr == nil && f.HasDyldChainedFixups() {
+		dcf, err := f.DyldChainedFixups()
+		if err == nil && dcf != nil {
+			if format, fmtErr := dcf.PointerFormatForOffset(offset); fmtErr == nil {
+				size := fixupchains.PointerSize(format)
+				if size == 4 || size == 8 {
+					n, readErr := f.cr.ReadAt(rawBuf[:size], int64(offset))
+					if readErr == nil && n == size {
+						if size == 4 {
+							raw = uint64(f.ByteOrder.Uint32(rawBuf[:4]))
+						} else {
+							raw = f.ByteOrder.Uint64(rawBuf[:8])
+						}
+						rawRead = true
+						if target, rebErr := dcf.RebaseRaw(offset, raw, f.GetBaseAddress()); rebErr == nil {
+							return target + f.preferredLoadAddress(), nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if !rawRead {
+		if err := f.cr.SeekToAddr(address); err != nil {
+			return 0, fmt.Errorf("failed to Seek to address %#x: %v", address, err)
+		}
+		if err := binary.Read(f.cr, f.ByteOrder, &raw); err != nil {
+			return 0, fmt.Errorf("failed to read pointer @ %#x: %v", address, err)
+		}
+	}
+
+	if resolved, ok := f.decodeDyldInfoPointerAtAddress(address, raw); ok {
+		return resolved, nil
+	}
+
+	return f.SlidePointer(raw), nil
+}
+
+func (f *File) decodeChainedPointer(value uint64) (uint64, bool) {
+	if value == 0 || !f.HasDyldChainedFixups() {
+		return 0, false
+	}
+
+	dcf, err := f.DyldChainedFixups()
+	if err != nil || dcf == nil {
+		return 0, false
+	}
+
+	if target, ok := dcf.IsRebase(value, f.GetBaseAddress()); ok {
+		return target + f.preferredLoadAddress(), true
+	}
+
+	bind, addend, ok := dcf.IsBind(value)
+	if !ok {
+		return 0, false
+	}
+
+	if bind.LibOrdinal() == types.BIND_SPECIAL_DYLIB_SELF {
+		symAddr, err := f.FindSymbolAddress(bind.Name)
+		if err != nil {
+			return 0, true
+		}
+		return uint64(int64(symAddr) + addend), true
+	}
+
+	return value, true
+}
+
+func (f *File) buildDyldInfoFixupsCache() error {
+	if f.dyldInfoCacheBuilt {
+		return nil
+	}
+
+	f.dyldInfoRebaseTargets = make(map[uint64]uint64)
+	f.dyldInfoRebaseValues = make(map[uint64]struct{})
+	f.dyldInfoBindsByAddr = make(map[uint64]types.Bind)
+
+	rebases, err := f.GetRebaseInfo()
+	if err != nil && !errors.Is(err, ErrMachODyldInfoNotFound) {
+		return err
+	}
+	for _, rebase := range rebases {
+		addr := rebase.Start + rebase.Offset
+		f.dyldInfoRebaseTargets[addr] = f.normalizeDyldInfoPointer(rebase.Value)
+		f.dyldInfoRebaseValues[rebase.Value] = struct{}{}
+	}
+
+	binds, err := f.GetBindInfo()
+	if err != nil && !errors.Is(err, ErrMachODyldInfoNotFound) {
+		return err
+	}
+	for _, bind := range binds {
+		addr := bind.Start + bind.SegOffset
+		if _, exists := f.dyldInfoBindsByAddr[addr]; exists {
+			continue
+		}
+		f.dyldInfoBindsByAddr[addr] = bind
+	}
+
+	f.dyldInfoCacheBuilt = true
+	return nil
+}
+
+func (f *File) normalizeDyldInfoPointer(value uint64) uint64 {
+	if value == 0 {
+		return 0
+	}
+	if f.FindSegmentForVMAddr(value) != nil {
+		return value
+	}
+
+	base := f.GetBaseAddress()
+	if value >= base {
+		return value
+	}
+
+	candidate := value + base
+	if f.FindSegmentForVMAddr(candidate) != nil {
+		return candidate
+	}
+
+	return value
+}
+
+func (f *File) usesDyldInfoOnlyFixups() bool {
+	return f.HasDyldInfoOnly() && !f.HasDyldChainedFixups()
+}
+
+func (f *File) decodeDyldInfoPointer(value uint64) (uint64, bool) {
+	if value == 0 || !f.usesDyldInfoOnlyFixups() {
+		return 0, false
+	}
+
+	if err := f.buildDyldInfoFixupsCache(); err != nil {
+		return 0, false
+	}
+	if _, ok := f.dyldInfoRebaseValues[value]; !ok {
+		return 0, false
+	}
+	return f.normalizeDyldInfoPointer(value), true
+}
+
+func (f *File) decodeDyldInfoPointerAtAddress(address, raw uint64) (uint64, bool) {
+	if !f.usesDyldInfoOnlyFixups() {
+		return 0, false
+	}
+
+	if err := f.buildDyldInfoFixupsCache(); err != nil {
+		return 0, false
+	}
+
+	if resolved, ok := f.dyldInfoRebaseTargets[address]; ok {
+		return resolved, true
+	}
+
+	if bind, ok := f.dyldInfoBindsByAddr[address]; ok {
+		if bind.Dylib == f.LibraryOrdinalName(types.BIND_SPECIAL_DYLIB_SELF) {
+			symAddr, err := f.FindSymbolAddress(bind.Name)
+			if err != nil {
+				return 0, true
+			}
+			return uint64(int64(symAddr) + bind.Addend), true
+		}
+		return raw, true
+	}
+
+	return 0, false
 }
 
 // SlidePointer returns slid or un-chained pointer
 func (f *File) SlidePointer(ptr uint64) uint64 {
+	if resolved, ok := f.decodeChainedPointer(ptr); ok {
+		return resolved
+	}
+	if resolved, ok := f.decodeDyldInfoPointer(ptr); ok {
+		return resolved
+	}
 	return f.vma.Convert(ptr)
 }
 
@@ -1611,21 +1852,11 @@ func (f *File) convertToVMAddr(value uint64) uint64 {
 	if value == 0 {
 		return 0
 	}
-	if f.HasFixups() {
-		if dcf, err := f.DyldChainedFixups(); err == nil {
-			if target, ok := dcf.IsRebase(value, f.GetBaseAddress()); ok {
-				return target + f.preferredLoadAddress()
-			} else if bind, addend, ok := dcf.IsBind(value); ok {
-				if bind.Import.LibOrdinal() == types.BIND_SPECIAL_DYLIB_SELF {
-					symAddr, err := f.FindSymbolAddress(bind.Name)
-					if err != nil {
-						return 0
-					}
-					return uint64(int64(symAddr) + addend)
-				}
-				return value
-			}
-		}
+	if resolved, ok := f.decodeChainedPointer(value); ok {
+		return resolved
+	}
+	if resolved, ok := f.decodeDyldInfoPointer(value); ok {
+		return resolved
 	} else if f.isArm64e() {
 		// TODO: fix this dumb hack for SUPPORT_OLD_ARM64E_FORMAT
 		dcf := fixupchains.DyldChainedFixups{
@@ -1634,7 +1865,7 @@ func (f *File) convertToVMAddr(value uint64) uint64 {
 		if target, ok := dcf.IsRebase(value, f.GetBaseAddress()); ok {
 			return target + f.preferredLoadAddress()
 		} else if bind, addend, ok := dcf.IsBind(value); ok {
-			if bind.Import.LibOrdinal() == types.BIND_SPECIAL_DYLIB_SELF {
+			if bind.LibOrdinal() == types.BIND_SPECIAL_DYLIB_SELF {
 				symAddr, err := f.FindSymbolAddress(bind.Name)
 				if err != nil {
 					return 0
@@ -1682,20 +1913,73 @@ func (f *File) GetBindName(pointer uint64) (string, error) {
 
 // GetCString returns a c-string at a given virtual address in the MachO
 func (f *File) GetCString(addr uint64) (string, error) {
-	if err := f.cr.SeekToAddr(addr); err != nil {
-		return "", fmt.Errorf("failed to Seek to address %#x: %v", addr, err)
+	const maxLength = 1 << 20 // 1 MiB safety cap
+
+	bp := cstringBufPool.Get().(*[]byte)
+	buf := *bp
+	defer cstringBufPool.Put(bp)
+
+	var out []byte
+	current := addr
+
+	for len(out) < maxLength {
+		n, err := f.cr.ReadAtAddr(buf, current)
+		if n > 0 {
+			nullIdx := bytes.IndexByte(buf[:n], 0)
+			if nullIdx >= 0 {
+				out = append(out, buf[:nullIdx]...)
+				if len(out) == 0 {
+					return "", nil
+				}
+				return string(out), nil
+			}
+			out = append(out, buf[:n]...)
+			current += uint64(n)
+			if errors.Is(err, io.EOF) {
+				return "", fmt.Errorf("%w at address %#x", ErrCStringNoTerminator, addr)
+			}
+			continue
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if len(out) == 0 {
+					return "", fmt.Errorf("%w at address %#x", ErrCStringNotFound, addr)
+				}
+				return "", fmt.Errorf("%w at address %#x", ErrCStringNoTerminator, addr)
+			}
+			return "", fmt.Errorf("failed to read at address %#x: %w", current, err)
+		}
+
+		// No bytes read and no error, avoid infinite loop
+		break
 	}
 
-	s, err := bufio.NewReader(f.cr).ReadString('\x00')
-	if err != nil {
-		return "", fmt.Errorf("failed to read strubg at address %#x, %v", addr, err)
+	if len(out) == 0 {
+		return "", fmt.Errorf("%w at address %#x", ErrCStringNotFound, addr)
 	}
+	return "", fmt.Errorf("%w at address %#x", ErrCStringNoTerminator, addr)
+}
 
-	if len(s) > 0 {
-		return strings.Trim(s, "\x00"), nil
+// getUTF16String reads a UTF-16LE encoded string at a given virtual address.
+// charCount is the number of UTF-16 code units (not bytes).
+func (f *File) getUTF16String(addr, charCount uint64) (string, error) {
+	if charCount == 0 {
+		return "", nil
 	}
-
-	return "", fmt.Errorf("string not found at address %#x", addr)
+	const maxCharCount = 1 << 20 // 1M code units safety cap
+	if charCount > maxCharCount {
+		return "", fmt.Errorf("implausible UTF-16 char count %d at address %#x", charCount, addr)
+	}
+	buf := make([]byte, charCount*2)
+	if _, err := f.cr.ReadAtAddr(buf, addr); err != nil {
+		return "", fmt.Errorf("failed to read UTF-16 string at address %#x: %w", addr, err)
+	}
+	codes := make([]uint16, charCount)
+	for i := range codes {
+		codes[i] = f.ByteOrder.Uint16(buf[i*2:])
+	}
+	return string(utf16.Decode(codes)), nil
 }
 
 func (f *File) GetCStrings() (map[string]map[string]uint64, error) {
@@ -1703,10 +1987,10 @@ func (f *File) GetCStrings() (map[string]map[string]uint64, error) {
 
 	for _, sec := range f.Sections {
 		if sec.Flags.IsCstringLiterals() || sec.Name == "__os_log" {
-			f.cr.SeekToAddr(sec.Addr)
+			// Thread-safe: Use ReadAtAddr which doesn't modify shared state
 			dat := make([]byte, sec.Size)
-			if _, err := f.cr.Read(dat); err != nil {
-				return nil, fmt.Errorf("failed to read cstring data in %s.%s: %v", sec.Seg, sec.Name, err)
+			if _, err := f.cr.ReadAtAddr(dat, sec.Addr); err != nil {
+				return nil, fmt.Errorf("failed to read cstring data in %s.%s: %w", sec.Seg, sec.Name, err)
 			}
 
 			section := fmt.Sprintf("%s.%s", sec.Seg, sec.Name)
@@ -1730,12 +2014,17 @@ func (f *File) GetCStrings() (map[string]map[string]uint64, error) {
 				s = strings.Trim(s, "\x00")
 
 				if len(s) > 0 {
+					// Check if string contains printable characters (including Unicode like emojis)
+					isPrintable := true
 					for _, r := range s {
-						if r > unicode.MaxASCII || !unicode.IsPrint(r) {
-							continue // skip non-ascii strings
+						if !unicode.IsPrint(r) && !unicode.IsSpace(r) {
+							isPrintable = false
+							break
 						}
 					}
-					strs[section][s] = pos
+					if isPrintable {
+						strs[section][s] = pos
+					}
 				}
 			}
 		}
@@ -1746,20 +2035,51 @@ func (f *File) GetCStrings() (map[string]map[string]uint64, error) {
 
 // GetCStringAtOffset returns a c-string at a given offset into the MachO
 func (f *File) GetCStringAtOffset(strOffset int64) (string, error) {
-	if _, err := f.cr.Seek(strOffset, io.SeekStart); err != nil {
-		return "", fmt.Errorf("failed to Seek to offset %#x: %v", strOffset, err)
+	const (
+		chunkSize = 0x1000  // 4 KiB per read attempt
+		maxLength = 1 << 20 // 1 MiB safety cap
+	)
+
+	buf := make([]byte, chunkSize)
+	var out []byte
+	current := strOffset
+
+	for len(out) < maxLength {
+		n, err := f.cr.ReadAt(buf, current)
+		if n > 0 {
+			nullIdx := bytes.IndexByte(buf[:n], 0)
+			if nullIdx >= 0 {
+				out = append(out, buf[:nullIdx]...)
+				if len(out) == 0 {
+					return "", nil
+				}
+				return string(out), nil
+			}
+			out = append(out, buf[:n]...)
+			current += int64(n)
+			if errors.Is(err, io.EOF) {
+				return "", fmt.Errorf("%w at offset %#x", ErrCStringNoTerminator, strOffset)
+			}
+			continue
+		}
+
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if len(out) == 0 {
+					return "", fmt.Errorf("%w at offset %#x", ErrCStringNotFound, strOffset)
+				}
+				return "", fmt.Errorf("%w at offset %#x", ErrCStringNoTerminator, strOffset)
+			}
+			return "", fmt.Errorf("failed to read at offset %#x: %w", current, err)
+		}
+
+		break
 	}
 
-	s, err := bufio.NewReader(f.cr).ReadString('\x00')
-	if err != nil {
-		return "", fmt.Errorf("failed to ReadString as offset %#x, %v", strOffset, err)
+	if len(out) == 0 {
+		return "", fmt.Errorf("%w at offset %#x", ErrCStringNotFound, strOffset)
 	}
-
-	if len(s) > 0 {
-		return strings.Trim(s, "\x00"), nil
-	}
-
-	return "", fmt.Errorf("string not found at offset %#x", strOffset)
+	return "", fmt.Errorf("%w at offset %#x", ErrCStringNoTerminator, strOffset)
 }
 
 // IsCString returns cstring at given virtual address if is in a CstringLiterals section
@@ -2005,6 +2325,159 @@ func (f *File) FunctionStarts() *FunctionStarts {
 		}
 	}
 	return nil
+}
+
+// FunctionVariants returns the LC_FUNCTION_VARIANTS load command, or nil if none exists.
+func (f *File) FunctionVariants() *FunctionVariants {
+	for _, l := range f.Loads {
+		if fv, ok := l.(*FunctionVariants); ok {
+			return fv
+		}
+	}
+	return nil
+}
+
+// FunctionVariantFixups returns the LC_FUNCTION_VARIANT_FIXUPS load command, or nil if none exists.
+func (f *File) FunctionVariantFixups() *FunctionVariantFixups {
+	for _, l := range f.Loads {
+		if fv, ok := l.(*FunctionVariantFixups); ok {
+			return fv
+		}
+	}
+	return nil
+}
+
+// GetFunctionVariants parses and returns the function variants data.
+func (f *File) GetFunctionVariants() (*types.FuncVarData, error) {
+	fv := f.FunctionVariants()
+	if fv == nil {
+		return nil, fmt.Errorf("LC_FUNCTION_VARIANTS not found")
+	}
+
+	// Return cached data if already parsed
+	if fv.Data != nil {
+		f.resolveFunctionVariantSymbolsIfParsed(fv)
+		return fv.Data, nil
+	}
+
+	// Read the payload data
+	data := make([]byte, fv.Size)
+	if _, err := f.cr.ReadAt(data, int64(fv.Offset)); err != nil {
+		return nil, fmt.Errorf("failed to read function variants data: %v", err)
+	}
+
+	// Parse the data
+	parsed, err := ParseFunctionVariants(data, f.ByteOrder)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the parsed data
+	fv.Data = parsed
+
+	f.resolveFunctionVariantSymbolsIfParsed(fv)
+
+	return parsed, nil
+}
+
+// GetFunctionVariantFixups parses and returns the function variant fixups data.
+func (f *File) GetFunctionVariantFixups() (*types.FuncVarFixupsData, error) {
+	fv := f.FunctionVariantFixups()
+	if fv == nil {
+		return nil, fmt.Errorf("LC_FUNCTION_VARIANT_FIXUPS not found")
+	}
+
+	// Return cached data if already parsed
+	if fv.Data != nil {
+		return fv.Data, nil
+	}
+
+	// Read the payload data
+	data := make([]byte, fv.Size)
+	if _, err := f.cr.ReadAt(data, int64(fv.Offset)); err != nil {
+		return nil, fmt.Errorf("failed to read function variant fixups data: %v", err)
+	}
+
+	// Parse the data
+	parsed, err := ParseFunctionVariantFixups(data, f.ByteOrder)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the parsed data
+	fv.Data = parsed
+
+	return parsed, nil
+}
+
+// Enrich pre-parses optional data to add detail to load command stringers/JSON.
+// It is best-effort; any encountered errors are returned as a joined error.
+func (f *File) Enrich() error {
+	var errs []error
+
+	if f.DyldExportsTrie() != nil {
+		if _, err := f.DyldExports(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if f.FunctionVariants() != nil {
+		if _, err := f.GetFunctionVariants(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if f.FunctionVariantFixups() != nil {
+		if _, err := f.GetFunctionVariantFixups(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
+}
+
+func (f *File) resolveFunctionVariantSymbolsIfParsed(fv *FunctionVariants) {
+	if fv == nil || fv.Data == nil || len(fv.Data.Tables) == 0 {
+		return
+	}
+	if f.Symtab == nil && f.exp == nil {
+		return
+	}
+
+	addrToName := make(map[uint64]string)
+	if f.Symtab != nil {
+		addrToName = make(map[uint64]string, len(f.Symtab.Syms))
+		for _, sym := range f.Symtab.Syms {
+			if _, ok := addrToName[sym.Value]; !ok {
+				addrToName[sym.Value] = sym.Name
+			}
+		}
+	}
+	if f.exp != nil {
+		for _, exp := range f.exp {
+			if _, ok := addrToName[exp.Address]; !ok {
+				addrToName[exp.Address] = exp.Name
+			}
+		}
+	}
+
+	if len(addrToName) == 0 {
+		return
+	}
+	for i := range fv.Data.Tables {
+		for j := range fv.Data.Tables[i].Entries {
+			entry := &fv.Data.Tables[i].Entries[j]
+			if entry.IsTableIndex() || entry.Symbol != "" {
+				continue
+			}
+			if name, ok := addrToName[uint64(entry.ImplValue())]; ok {
+				entry.Symbol = name
+			}
+		}
+	}
 }
 
 func (f *File) GenerateFunctionStarts() ([]types.Function, error) {
@@ -2266,7 +2739,7 @@ func (f *File) DyldChainedFixups() (*fixupchains.DyldChainedFixups, error) {
 			}
 			segs := f.Segments()
 			for idx, start := range dcf.Starts {
-				if start.PageStarts != nil {
+				if idx < len(segs) && start.PageStarts != nil {
 					// Replacing SegmentOffset(vmaddr) with FileOffset
 					// (for static analysis of binaries with split segs
 					// since we aren't actually loading the MachO
@@ -2275,10 +2748,12 @@ func (f *File) DyldChainedFixups() (*fixupchains.DyldChainedFixups, error) {
 					dcf.Starts[idx].SegmentOffset = segs[idx].Offset
 				}
 			}
-
-			dcf, err := dcf.Parse()
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse dyld chained fixups: %v", err)
+			dcf.ResetSegmentIndex()
+			if err := dcf.EnsureImports(); err != nil {
+				return nil, fmt.Errorf("failed to parse dyld chained fixup imports: %v", err)
+			}
+			if len(dcf.Starts) > 0 {
+				f.vma.ChainedPointerFormat = uint16(dcf.Starts[0].PointerFormat)
 			}
 
 			f.dcf = dcf // cache
@@ -2660,26 +3135,45 @@ func (f *File) GetBindInfo() (types.Binds, error) {
 }
 
 func (f *File) GetRebaseInfo() ([]types.Rebase, error) {
-	if dinfo := f.DyldInfo(); dinfo != nil {
-		if dinfo.RebaseSize > 0 {
-			dat := make([]byte, dinfo.RebaseSize)
-			if _, err := f.cr.ReadAt(dat, int64(dinfo.RebaseOff)); err != nil {
-				return nil, fmt.Errorf("failed to read rebase info: %v", err)
-			}
-			return f.parseRebase(bytes.NewReader(dat))
-		}
-	} else if dinfo := f.DyldInfoOnly(); dinfo != nil {
-		if dinfo.RebaseSize > 0 {
-			dat := make([]byte, dinfo.RebaseSize)
-			if _, err := f.cr.ReadAt(dat, int64(dinfo.RebaseOff)); err != nil {
-				return nil, fmt.Errorf("failed to read rebase info: %v", err)
-			}
-			return f.parseRebase(bytes.NewReader(dat))
-		}
-	} else {
+	if f.rebasesDone {
+		return f.rebases, nil
+	}
+	var (
+		rebaseOff  uint32
+		rebaseSize uint32
+	)
+
+	switch {
+	case f.DyldInfo() != nil:
+		dinfo := f.DyldInfo()
+		rebaseOff = dinfo.RebaseOff
+		rebaseSize = dinfo.RebaseSize
+	case f.DyldInfoOnly() != nil:
+		dinfo := f.DyldInfoOnly()
+		rebaseOff = dinfo.RebaseOff
+		rebaseSize = dinfo.RebaseSize
+	default:
 		return nil, ErrMachODyldInfoNotFound
 	}
-	return nil, nil
+
+	if rebaseSize == 0 {
+		f.rebasesDone = true
+		return nil, nil
+	}
+
+	dat := make([]byte, rebaseSize)
+	if _, err := f.cr.ReadAt(dat, int64(rebaseOff)); err != nil {
+		return nil, fmt.Errorf("failed to read rebase info: %v", err)
+	}
+
+	rebases, err := f.parseRebase(bytes.NewReader(dat))
+	if err != nil {
+		return nil, err
+	}
+
+	f.rebases = rebases
+	f.rebasesDone = true
+	return f.rebases, nil
 }
 
 func (f *File) GetExports() ([]trie.TrieExport, error) {
@@ -3051,7 +3545,7 @@ func (f *File) ImportedLibraries() []string {
 	return all
 }
 
-// LibraryOrdinalName returns the depancy library oridinal's name
+// LibraryOrdinalName returns the depancy library oridnal's name
 func (f *File) LibraryOrdinalName(libraryOrdinal int) string {
 	dylibs := f.ImportedLibraries()
 
@@ -3124,4 +3618,14 @@ func (f *File) FindAddressSymbols(addr uint64) ([]Symbol, error) {
 		return syms, nil
 	}
 	return nil, fmt.Errorf("symbol(s) not found in macho symtab for addr %#x", addr)
+}
+
+// SetSwiftAutoDemangle toggles automatic demangling of Swift metadata strings when parsing structures.
+func (f *File) SetSwiftAutoDemangle(enabled bool) {
+	f.swiftAutoDemangle = enabled
+}
+
+// SwiftAutoDemangle reports whether Swift metadata strings are automatically demangled.
+func (f *File) SwiftAutoDemangle() bool {
+	return f.swiftAutoDemangle
 }
