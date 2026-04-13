@@ -1297,11 +1297,6 @@ func (f *File) readProtocolConformance(r io.ReadSeeker, addr uint64) (pcd *swift
 	}
 
 	if pcd.Flags.NumConditionalPackShapeDescriptors() > 0 {
-		var hdr swift.GenericPackShapeHeader
-		if err := binary.Read(r, f.ByteOrder, &hdr); err != nil {
-			return nil, fmt.Errorf("failed to read conditional pack shape header: %v", err)
-		}
-		_ = hdr // TODO: use this
 		pcd.ConditionalPackShapes = make([]swift.GenericPackShapeDescriptor, pcd.Flags.NumConditionalPackShapeDescriptors())
 		if err := binary.Read(r, f.ByteOrder, &pcd.ConditionalPackShapes); err != nil {
 			return nil, fmt.Errorf("failed to read conditional pack shape descriptors: %v", err)
@@ -2629,14 +2624,26 @@ func (f *File) getContextDesc(addr uint64) (ctx *swift.TargetModuleContext, err 
 	var ptr uint64
 
 	if (addr & 1) == 1 {
+		// Indirect pointer: the relative-offset points at a GOT slot whose
+		// content is the real descriptor address.  On-disk binaries often
+		// have chained-fixup encodings in those slots, so the slot's raw
+		// value is not a valid VM address.  Fall back to a bind-name lookup
+		// rather than returning a hard error.
 		addr = addr &^ 1
 		ptr, err = f.GetPointerAtAddress(addr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read swift context descriptor pointer at address %#x: %v", addr, err)
+			if bind, err := f.GetBindName(addr); err == nil {
+				return &swift.TargetModuleContext{Name: bind}, nil
+			}
+			return &swift.TargetModuleContext{}, nil
 		}
 		ptr = f.vma.Convert(ptr)
 	} else {
 		ptr = addr
+	}
+
+	if ptr == 0 {
+		return &swift.TargetModuleContext{}, nil
 	}
 
 	if err := f.cr.SeekToAddr(ptr); err != nil {
@@ -2651,11 +2658,20 @@ func (f *File) getContextDesc(addr uint64) (ctx *swift.TargetModuleContext, err 
 				}
 			}
 		}
+		// Address is not in this binary (external reference); return an empty
+		// context so callers can continue without the parent qualification.
+		return &swift.TargetModuleContext{}, nil
 	}
 
 	ctx = &swift.TargetModuleContext{}
 	if err := ctx.TargetModuleContextDescriptor.Read(f.cr, ptr); err != nil {
-		return nil, fmt.Errorf("failed to read swift context descriptor: %w", err)
+		// The address is in-range but doesn't contain a valid descriptor
+		// (e.g., indirect pointer resolved to a non-descriptor location).
+		// Try symbol resolution before giving up.
+		if bind, err := f.GetBindName(ptr); err == nil {
+			return &swift.TargetModuleContext{Name: bind}, nil
+		}
+		return &swift.TargetModuleContext{}, nil
 	}
 
 	if ctx.ParentOffset.IsSet() {
