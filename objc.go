@@ -17,6 +17,13 @@ var ErrObjcSectionNotFound = errors.New("missing required ObjC section")
 var ErrObjcSectionNEmpty = errors.New("required ObjC section is empty")
 var ErrObjcFragileRuntimeUnsupported = errors.New("objective-c fragile runtime metadata is unsupported")
 
+// ErrObjCSelectorBaseUnavailable indicates a relative ObjC method list whose
+// selectors are offsets into the shared cache's global selector-string table,
+// which is not present when parsing a dylib in isolation (e.g. one extracted
+// from a dyld_shared_cache). Such method names can only be resolved against the
+// full cache.
+var ErrObjCSelectorBaseUnavailable = errors.New("ObjC relative method selectors require the shared cache's selector base, which is unavailable in a standalone dylib")
+
 var legacyObjCSectionNames = map[string]struct{}{
 	"__image_info":     {},
 	"__module_info":    {},
@@ -1055,7 +1062,11 @@ func (f *File) parseObjcProtocolList(vmaddr uint64) ([]objc.Protocol, error) {
 	}
 
 	for _, protPtr := range protList.Protocols {
-		prot, err := f.getObjcProtocol(f.vma.Convert(protPtr))
+		protAddr := f.vma.Convert(protPtr)
+		if !f.addrResolvable(protAddr) {
+			continue // skip cross-image (external) protocol reference
+		}
+		prot, err := f.getObjcProtocol(protAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -1186,6 +1197,15 @@ func (f *File) getObjcProtocol(vmaddr uint64) (proto *objc.Protocol, err error) 
 	return proto, nil
 }
 
+// ObjCSelectorBaseUnavailable reports whether ObjC parsing encountered a
+// relative method list whose selectors are offsets into the shared cache's
+// global selector-string table. That table is absent when a dylib is parsed in
+// isolation (e.g. extracted from a dyld_shared_cache), so such method names
+// cannot be resolved without the full cache. See [ErrObjCSelectorBaseUnavailable].
+func (f *File) ObjCSelectorBaseUnavailable() bool {
+	return f.objcSelectorBaseUnavailable
+}
+
 // GetObjCProtocols returns the Objective-C protocols
 func (f *File) GetObjCProtocols() ([]objc.Protocol, error) {
 	if err := f.ensureObjCNonFragileRuntime("GetObjCProtocols"); err != nil {
@@ -1212,9 +1232,13 @@ func (f *File) GetObjCProtocols() ([]objc.Protocol, error) {
 				}
 
 				for _, ptr := range ptrs {
-					proto, err := f.getObjcProtocol(f.vma.Convert(ptr))
+					protAddr := f.vma.Convert(ptr)
+					if !f.addrResolvable(protAddr) {
+						continue // skip cross-image (external) protocol reference
+					}
+					proto, err := f.getObjcProtocol(protAddr)
 					if err != nil {
-						return nil, fmt.Errorf("failed to read protocol at pointer %#x (converted %#x); %v", ptr, f.vma.Convert(ptr), err)
+						return nil, fmt.Errorf("failed to read protocol at pointer %#x (converted %#x); %v", ptr, protAddr, err)
 					}
 					protocols = append(protocols, *proto)
 				}
@@ -1335,9 +1359,13 @@ func (f *File) forEachObjCMethod(methodListVMAddr uint64, handler func(uint64, o
 
 			if methodList.UsesDirectOffsetsToSelectors() {
 				if f.sharedCacheRelativeSelectorBaseVMAddress != 0 {
-					method.NameVMAddr = uint64(int64(f.sharedCacheRelativeSelectorBaseVMAddress) + int64(m.NameOffset))
+					// nameOffset is an unsigned offset into the shared cache's
+					// selector strings buffer (dyld reads it as uint32), matching
+					// the relative method types buffer handling below.
+					method.NameVMAddr = f.sharedCacheRelativeSelectorBaseVMAddress + uint64(uint32(m.NameOffset))
 				} else {
-					method.NameVMAddr = uint64(methodVMAddr + int64(m.NameOffset))
+					f.objcSelectorBaseUnavailable = true
+					return fmt.Errorf("%w (method list %#x)", ErrObjCSelectorBaseUnavailable, methodListVMAddr)
 				}
 			} else {
 				// RelativePointer offsets are relative to the field address, not the struct base
@@ -1355,7 +1383,14 @@ func (f *File) forEachObjCMethod(methodListVMAddr uint64, handler func(uint64, o
 			// This matches Apple's objc4 RelativePointer implementation: actual_address = &offset_field + offset
 			typesFieldAddr := methodVMAddr + int64(unsafe.Offsetof(m.TypesOffset))
 			impFieldAddr := methodVMAddr + int64(unsafe.Offsetof(m.ImpOffset))
-			method.TypesVMAddr = uint64(typesFieldAddr + int64(m.TypesOffset))
+			if methodList.UsesDirectOffsetsToTypes() && f.sharedCacheRelativeSelectorBaseVMAddress != 0 {
+				// iOS 27+: typesOffset is an unsigned offset into the shared cache's
+				// relative method types buffer (which follows the selector strings
+				// buffer), measured from the same selector base address.
+				method.TypesVMAddr = f.sharedCacheRelativeSelectorBaseVMAddress + uint64(uint32(m.TypesOffset))
+			} else {
+				method.TypesVMAddr = uint64(typesFieldAddr + int64(m.TypesOffset))
+			}
 			method.ImpVMAddr = uint64(impFieldAddr + int64(m.ImpOffset))
 
 			method.Name, err = f.getCStringWithFallback(method.NameVMAddr, "selector", false)

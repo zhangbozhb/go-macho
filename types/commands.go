@@ -79,6 +79,7 @@ const (
 	LC_FUNCTION_VARIANTS        LoadCmd = 0x37                 /* used with linkedit_data_command */
 	LC_FUNCTION_VARIANT_FIXUPS  LoadCmd = 0x38                 /* used with linkedit_data_command */
 	LC_TARGET_TRIPLE            LoadCmd = 0x39                 /* target triple used to compile */
+	LC_LAZY_LOAD_DYLIB_INFO     LoadCmd = 0x3a                 /* used with linkedit_data_command */
 	/*
 	 * sep load commands
 	 */
@@ -240,10 +241,31 @@ const (
 	DYLIB_USE_DELAYED_INIT DylibUseFlags = 0x08
 )
 
+func (f DylibUseFlags) List() []string {
+	var flags []string
+	if (f & DYLIB_USE_WEAK_LINK) != 0 {
+		flags = append(flags, "weak-link")
+	}
+	if (f & DYLIB_USE_REEXPORT) != 0 {
+		flags = append(flags, "re-export")
+	}
+	if (f & DYLIB_USE_UPWARD) != 0 {
+		flags = append(flags, "upward")
+	}
+	if (f & DYLIB_USE_DELAYED_INIT) != 0 {
+		flags = append(flags, "delay-init")
+	}
+	return flags
+}
+
+func (f DylibUseFlags) String() string {
+	return strings.Join(f.List(), "|")
+}
+
 const DYLIB_USE_MARKER = 0x1a741800
 
 /*
- * DylibUseCmd is an alternate encoding for: LC_LOAD_DYLIB.
+ * DylibUseCmd is an alternate encoding for dylib load commands.
  * The flags field contains independent flags DYLIB_USE_*
  * First supported in macOS 15, iOS 18.
  */
@@ -861,8 +883,9 @@ type LinkEditDataCmd struct {
 	   LC_DYLIB_CODE_SIGN_DRS,
 	   LC_ATOM_INFO,
 	   LC_LINKER_OPTIMIZATION_HINT,
-	   LC_DYLD_EXPORTS_TRIE, or
-	   LC_DYLD_CHAINED_FIXUPS. */
+	   LC_DYLD_EXPORTS_TRIE,
+	   LC_DYLD_CHAINED_FIXUPS, or
+	   LC_LAZY_LOAD_DYLIB_INFO. */
 	Len    uint32 // sizeof(struct linkedit_data_command)
 	Offset uint32 // file offset of data in __LINKEDIT segment
 	Size   uint32 // file size of data in __LINKEDIT segment
@@ -888,6 +911,8 @@ type DyldChainedFixupsCmd LinkEditDataCmd // LC_DYLD_CHAINED_FIXUPS
 type FunctionVariantsCmd LinkEditDataCmd // LC_FUNCTION_VARIANTS
 // A FunctionVariantFixupsCmd is used with linkedit_data_command command.
 type FunctionVariantFixupsCmd LinkEditDataCmd // LC_FUNCTION_VARIANT_FIXUPS
+// A LazyLoadDylibInfoCmd is used with linkedit_data_command command.
+type LazyLoadDylibInfoCmd LinkEditDataCmd // LC_LAZY_LOAD_DYLIB_INFO
 
 /*
  * FunctionVariants payload structures

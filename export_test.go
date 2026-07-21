@@ -1,7 +1,10 @@
 package macho
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/blacktop/go-macho/types"
 )
 
 func TestPointerAlignPad(t *testing.T) {
@@ -56,6 +59,137 @@ func TestPageAlign(t *testing.T) {
 				t.Errorf("pageAlign(%#x, %#x) = %#x, want %#x", tt.off, tt.align, got, tt.want)
 			}
 		})
+	}
+}
+
+func newTextSegmentFile(seg SegmentHeader, sections ...*types.Section) *File {
+	seg.LoadCmd = types.LC_SEGMENT_64
+	seg.Name = "__TEXT"
+	text := &Segment{
+		SegmentHeader: seg,
+	}
+	return &File{
+		FileTOC: FileTOC{
+			Loads:    loads{text},
+			Sections: sections,
+		},
+	}
+}
+
+func newTextSection(addr uint64, offset uint32) *types.Section {
+	return &types.Section{
+		SectionHeader: types.SectionHeader{
+			Name:   "__text",
+			Seg:    "__TEXT",
+			Addr:   addr,
+			Offset: offset,
+		},
+	}
+}
+
+func requireErrorContains(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected error containing %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected error containing %q, got %v", want, err)
+	}
+}
+
+func TestTextSegmentFirstSectionRelOffUsesVMAddrForCachedImages(t *testing.T) {
+	f := newTextSegmentFile(
+		SegmentHeader{
+			Addr:   0x180000000,
+			Offset: 0x3f000000,
+			Nsect:  1,
+		},
+		newTextSection(0x180004000, 0x4000),
+	)
+
+	got, err := f.textSegmentFirstSectionRelOff(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0x4000 {
+		t.Errorf("textSegmentFirstSectionRelOff(true) = %#x, want 0x4000", got)
+	}
+}
+
+func TestTextSegmentFirstSectionRelOffRejectsInvalidCachedAddress(t *testing.T) {
+	f := newTextSegmentFile(
+		SegmentHeader{
+			Addr:   0x180004000,
+			Offset: 0x3f000000,
+			Nsect:  1,
+		},
+		newTextSection(0x180000000, 0x4000),
+	)
+
+	_, err := f.textSegmentFirstSectionRelOff(true)
+	requireErrorContains(t, err, "precedes segment address")
+}
+
+func TestTextSegmentFirstSectionRelOffRejectsInvalidFileOffset(t *testing.T) {
+	f := newTextSegmentFile(
+		SegmentHeader{
+			Addr:   0x100000000,
+			Offset: 0x8000,
+			Nsect:  1,
+		},
+		newTextSection(0x100001000, 0x1000),
+	)
+
+	_, err := f.textSegmentFirstSectionRelOff(false)
+	requireErrorContains(t, err, "precedes segment offset")
+}
+
+func TestTextSegmentFirstSectionRelOffRejectsInvalidSectionIndex(t *testing.T) {
+	f := newTextSegmentFile(SegmentHeader{
+		Addr:      0x100000000,
+		Nsect:     1,
+		Firstsect: 1,
+	})
+
+	_, err := f.textSegmentFirstSectionRelOff(false)
+	requireErrorContains(t, err, "out of range")
+}
+
+func TestTextSegmentFirstSectionRelOffRejectsHugeSectionIndex(t *testing.T) {
+	f := newTextSegmentFile(SegmentHeader{
+		Addr:      0x100000000,
+		Nsect:     1,
+		Firstsect: ^uint32(0),
+	})
+
+	_, err := f.textSegmentFirstSectionRelOff(false)
+	requireErrorContains(t, err, "out of range")
+}
+
+func TestTextSegmentFirstSectionRelOffNoTextSegment(t *testing.T) {
+	f := &File{}
+
+	got, err := f.textSegmentFirstSectionRelOff(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0 {
+		t.Errorf("textSegmentFirstSectionRelOff without __TEXT = %#x, want 0", got)
+	}
+}
+
+func TestTextSegmentWriteStartRejectsOutOfRangeStart(t *testing.T) {
+	_, err := textSegmentWriteStart(0x400000000, 0x2000, 0x10000)
+	requireErrorContains(t, err, "exceeds segment data length")
+}
+
+func TestTextSegmentWriteStartUsesEndOfLoadsWhenLarger(t *testing.T) {
+	got, err := textSegmentWriteStart(0x1000, 0x2000, 0x4000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 0x2000 {
+		t.Errorf("textSegmentWriteStart = %#x, want 0x2000", got)
 	}
 }
 
@@ -152,4 +286,65 @@ func TestSegMapRemap(t *testing.T) {
 			t.Error("Lookup(__BOGUS) should return false")
 		}
 	})
+}
+
+func newFunctionVariantLoads(fvOff, ffOff uint32) (*FunctionVariants, *FunctionVariantFixups) {
+	fv := &FunctionVariants{
+		LinkEditData: LinkEditData{
+			LinkEditDataCmd: types.LinkEditDataCmd{LoadCmd: types.LC_FUNCTION_VARIANTS, Offset: fvOff, Size: 0x20},
+		},
+	}
+	ff := &FunctionVariantFixups{
+		LinkEditData: LinkEditData{
+			LinkEditDataCmd: types.LinkEditDataCmd{LoadCmd: types.LC_FUNCTION_VARIANT_FIXUPS, Offset: ffOff, Size: 0x8},
+		},
+	}
+	return fv, ff
+}
+
+func functionVariantSegMap() exportSegMap {
+	return exportSegMap{
+		{
+			Name:       "__LINKEDIT",
+			Old:        segInfo{Start: 0x30000, End: 0x40000},
+			New:        segInfo{Start: 0x5000, End: 0x15000},
+			OrigMemsz:  0x10000,
+			OrigFilesz: 0x10000,
+		},
+	}
+}
+
+// On the non-cache path the function-variants linkedit offsets shift with the
+// segment, so optimizeLoadCommands must remap them through segMap.
+func TestOptimizeLoadCommandsRemapsFunctionVariants(t *testing.T) {
+	fv, ff := newFunctionVariantLoads(0x31000, 0x31100)
+	f := &File{FileTOC: FileTOC{Loads: loads{fv, ff}}}
+
+	if err := f.optimizeLoadCommands(functionVariantSegMap(), false); err != nil {
+		t.Fatal(err)
+	}
+	// new = New.Start + (off - Old.Start)
+	if fv.Offset != 0x6000 {
+		t.Errorf("FunctionVariants.Offset = %#x, want 0x6000", fv.Offset)
+	}
+	if ff.Offset != 0x6100 {
+		t.Errorf("FunctionVariantFixups.Offset = %#x, want 0x6100", ff.Offset)
+	}
+}
+
+// On the in-cache path optimizeLinkedit rewrites the offsets after copying the
+// blobs into the rebuilt __LINKEDIT, so optimizeLoadCommands must leave them be.
+func TestOptimizeLoadCommandsLeavesFunctionVariantsInCache(t *testing.T) {
+	fv, ff := newFunctionVariantLoads(0x31000, 0x31100)
+	f := &File{FileTOC: FileTOC{Loads: loads{fv, ff}}}
+
+	if err := f.optimizeLoadCommands(functionVariantSegMap(), true); err != nil {
+		t.Fatal(err)
+	}
+	if fv.Offset != 0x31000 {
+		t.Errorf("FunctionVariants.Offset = %#x, want it unchanged (0x31000)", fv.Offset)
+	}
+	if ff.Offset != 0x31100 {
+		t.Errorf("FunctionVariantFixups.Offset = %#x, want it unchanged (0x31100)", ff.Offset)
+	}
 }

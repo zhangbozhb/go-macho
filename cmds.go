@@ -12,6 +12,7 @@ import (
 
 	"github.com/blacktop/go-macho/internal/saferio"
 	"github.com/blacktop/go-macho/pkg/codesign"
+	"github.com/blacktop/go-macho/pkg/fixupchains"
 	"github.com/blacktop/go-macho/types"
 )
 
@@ -2600,6 +2601,140 @@ type SepUnknown3 struct {
 }
 
 /*******************************************************************************
+ * LC_LAZY_LOAD_DYLIB_INFO
+ *******************************************************************************/
+
+// LazyLoadDylibInfo is a Mach-O LC_LAZY_LOAD_DYLIB_INFO load command (0x3a / 58).
+// It is a linkedit_data_command pointing at a blob in the __LINKEDIT segment.
+// Data holds the decoded payload once File.GetLazyLoadedDylibs (or Enrich) is called.
+type LazyLoadDylibInfo struct {
+	LinkEditData
+	Data *LazyLoadedDylib
+}
+
+func (l *LazyLoadDylibInfo) String() string {
+	if l.Data == nil {
+		return fmt.Sprintf("offset=0x%09x size=0x%x", l.Offset, l.Size)
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "offset=0x%09x size=0x%x %s", l.Offset, l.Size, l.Data.LoadPath)
+	if l.Data.Weak {
+		out.WriteString(" (weak)")
+	}
+	fmt.Fprintf(&out, " (%s)", l.Data.PointerFormat)
+	if len(l.Data.Fixups) > 0 {
+		for _, fx := range l.Data.Fixups {
+			fmt.Fprintf(&out, "\n\t\t%#011x", fx.Address)
+			if fx.Auth {
+				fmt.Fprintf(&out, " (auth: key=%s addrDiv=%t div=%#x)", fixupchains.KeyName(uint64(fx.Key)), fx.AddrDiv, fx.Diversity)
+			}
+			fmt.Fprintf(&out, "  %s", fx.Symbol)
+		}
+	} else {
+		for _, sym := range l.Data.Symbols {
+			fmt.Fprintf(&out, "\n\t\t%s", sym)
+		}
+	}
+	return out.String()
+}
+func (l *LazyLoadDylibInfo) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		LoadCmd string           `json:"load_cmd"`
+		Len     uint32           `json:"length"`
+		Offset  uint32           `json:"offset"`
+		Size    uint32           `json:"size"`
+		Data    *LazyLoadedDylib `json:"data,omitempty"`
+	}{
+		LoadCmd: l.Command().String(),
+		Len:     l.Len,
+		Offset:  l.Offset,
+		Size:    l.Size,
+		Data:    l.Data,
+	})
+}
+
+// LazyLoadedDylib is the decoded LC_LAZY_LOAD_DYLIB_INFO payload, mirroring
+// dyld's LazyLoadDylibLinkEdit structure.
+type LazyLoadedDylib struct {
+	LoadPath              string                `json:"load_path"`                // dylib path to lazily load
+	Weak                  bool                  `json:"weak"`                     // may be missing at runtime (flag bit 0)
+	PointerFormat         fixupchains.DCPtrKind `json:"pointer_format"`           // DYLD_CHAINED_PTR_* format of the fixup chain
+	Symbols               []string              `json:"symbols,omitempty"`        // bound symbol names
+	Fixups                []LazyLoadFixup       `json:"fixups,omitempty"`         // GOT slots bound by the fixup chain (populated by File.GetLazyLoadedDylibs)
+	ChainStartImageOffset uint32                `json:"chain_start_image_offset"` // image offset of the fixup chain start
+}
+
+// LazyLoadFixup is one entry of an LC_LAZY_LOAD_DYLIB_INFO fixup chain: a slot
+// that is bound to a lazily-loaded symbol when the dylib is loaded.
+type LazyLoadFixup struct {
+	Address   uint64 `json:"address"`             // VM address of the bound slot
+	Offset    uint64 `json:"offset"`              // file offset of the bound slot
+	Ordinal   uint32 `json:"ordinal"`             // index into Symbols
+	Symbol    string `json:"symbol,omitempty"`    // Symbols[Ordinal], when resolvable
+	Auth      bool   `json:"auth"`                // PAC-signed slot
+	Key       uint8  `json:"key,omitempty"`       // PAC key (0=IA 1=IB 2=DA 3=DB) when Auth
+	AddrDiv   bool   `json:"addr_div,omitempty"`  // PAC address diversity when Auth
+	Diversity uint16 `json:"diversity,omitempty"` // PAC diversity constant when Auth
+}
+
+const (
+	lazyLoadDylibHeaderSize = 24
+	lazyLoadDylibFlagWeak   = 0x0001 // flags bit 0: weak-linked ("may be missing")
+)
+
+// ParseLazyLoadDylibInfo decodes an LC_LAZY_LOAD_DYLIB_INFO __LINKEDIT payload.
+// All offsets are validated against the blob length so that malformed or
+// truncated input returns an error rather than panicking.
+func ParseLazyLoadDylibInfo(data []byte, bo binary.ByteOrder) (*LazyLoadedDylib, error) {
+	if len(data) < lazyLoadDylibHeaderSize {
+		return nil, fmt.Errorf("lazy load dylib info payload too small: %d bytes (need >= %d)", len(data), lazyLoadDylibHeaderSize)
+	}
+
+	blobLen := uint32(len(data))
+
+	// Header layout: loadPathOffset@0, flagImageOffset@4, flags@8, pointerFormat@10,
+	// chainStartImageOffset@12, symbolsCount@16, symbolStringArrayOffset@20.
+	// flagImageOffset (the runtime "loaded" flag global) is not used here.
+	loadPathOffset := bo.Uint32(data[0:4])
+	flags := bo.Uint16(data[8:10])
+	pointerFormat := bo.Uint16(data[10:12])
+	chainStartImageOffset := bo.Uint32(data[12:16])
+	symbolsCount := bo.Uint32(data[16:20])
+	symbolStringArrayOffset := bo.Uint32(data[20:24])
+
+	if loadPathOffset >= blobLen {
+		return nil, fmt.Errorf("lazy load dylib info loadPathOffset 0x%x exceeds payload size 0x%x", loadPathOffset, blobLen)
+	}
+
+	// symbol offset array must fit: symbolStringArrayOffset + 4*symbolsCount <= len
+	arrayEnd := uint64(symbolStringArrayOffset) + 4*uint64(symbolsCount)
+	if arrayEnd > uint64(blobLen) {
+		return nil, fmt.Errorf("lazy load dylib info symbol offset array end 0x%x exceeds payload size 0x%x", arrayEnd, blobLen)
+	}
+
+	lld := &LazyLoadedDylib{
+		LoadPath:              cstring(data[loadPathOffset:]),
+		Weak:                  flags&lazyLoadDylibFlagWeak != 0,
+		PointerFormat:         fixupchains.DCPtrKind(pointerFormat),
+		ChainStartImageOffset: chainStartImageOffset,
+	}
+
+	if symbolsCount > 0 {
+		lld.Symbols = make([]string, symbolsCount)
+		for i := uint32(0); i < symbolsCount; i++ {
+			off := symbolStringArrayOffset + i*4
+			strOff := bo.Uint32(data[off : off+4])
+			if strOff >= blobLen {
+				return nil, fmt.Errorf("lazy load dylib info symbol %d string offset 0x%x exceeds payload size 0x%x", i, strOff, blobLen)
+			}
+			lld.Symbols[i] = cstring(data[strOff:])
+		}
+	}
+
+	return lld, nil
+}
+
+/*******************************************************************************
  * COMMON COMMANDS
  *******************************************************************************/
 
@@ -2607,11 +2742,30 @@ type SepUnknown3 struct {
 type Dylib struct {
 	LoadBytes
 	types.DylibCmd
-	Name string
+	Name  string
+	Flags types.DylibUseFlags // set when encoded as a dylib_use_command
+}
+
+// IsDylibUseCmd reports whether the command uses the alternate dylib_use_command
+// encoding (name offset 28 + marker in the timestamp field), mirroring dyld's
+// UnsafeHeader::loadCommandToDylibKind detection.
+func (d *Dylib) IsDylibUseCmd() bool {
+	return d.NameOffset == uint32(binary.Size(types.DylibUseCmd{})) && d.Timestamp == types.DYLIB_USE_MARKER
+}
+
+func (d *Dylib) setDylibUseFlags(b []byte, o binary.ByteOrder) {
+	if !d.IsDylibUseCmd() {
+		return
+	}
+	d.Flags = types.DylibUseFlags(o.Uint32(b[binary.Size(types.DylibCmd{}):]))
 }
 
 func (d *Dylib) LoadSize() uint32 {
-	return pointerAlign(uint32(binary.Size(d.DylibCmd)) + uint32(len(d.Name)) + 1)
+	headerSize := uint32(binary.Size(d.DylibCmd))
+	if d.IsDylibUseCmd() {
+		headerSize = uint32(binary.Size(types.DylibUseCmd{}))
+	}
+	return pointerAlign(headerSize + uint32(len(d.Name)) + 1)
 }
 func (d *Dylib) Put(b []byte, o binary.ByteOrder) int {
 	o.PutUint32(b[0*4:], uint32(d.LoadCmd))
@@ -2620,17 +2774,30 @@ func (d *Dylib) Put(b []byte, o binary.ByteOrder) int {
 	o.PutUint32(b[3*4:], d.Timestamp)
 	o.PutUint32(b[4*4:], uint32(d.CurrentVersion))
 	o.PutUint32(b[5*4:], uint32(d.CompatVersion))
+	if d.IsDylibUseCmd() {
+		o.PutUint32(b[6*4:], uint32(d.Flags))
+		return 7 * binary.Size(uint32(0))
+	}
 	return 6 * binary.Size(uint32(0))
 }
 func (d *Dylib) Write(buf *bytes.Buffer, o binary.ByteOrder) error {
+	start := buf.Len()
 	if err := binary.Write(buf, o, d.DylibCmd); err != nil {
 		return fmt.Errorf("failed to write %s to buffer: %v", d.Command(), err)
+	}
+	if d.IsDylibUseCmd() {
+		if err := binary.Write(buf, o, d.Flags); err != nil {
+			return fmt.Errorf("failed to write %s flags to buffer: %v", d.Command(), err)
+		}
 	}
 	if _, err := buf.WriteString(d.Name + "\x00"); err != nil {
 		return fmt.Errorf("failed to write %s to %s buffer: %v", d.Name, d.Command(), err)
 	}
-	if (buf.Len() % 8) != 0 {
-		pad := 8 - (buf.Len() % 8)
+	written := buf.Len() - start
+	if int(d.Len) < written {
+		return fmt.Errorf("%s cmdsize %d is smaller than the %d bytes written; Len must be recalculated (e.g. via LoadSize) after changing Name", d.Command(), d.Len, written)
+	}
+	if pad := int(d.Len) - written; pad > 0 {
 		if _, err := buf.Write(make([]byte, pad)); err != nil {
 			return fmt.Errorf("failed to write %s padding: %v", d.Command(), err)
 		}
@@ -2638,16 +2805,20 @@ func (d *Dylib) Write(buf *bytes.Buffer, o binary.ByteOrder) error {
 	return nil
 }
 func (d *Dylib) String() string {
+	if flags := d.Flags.List(); len(flags) > 0 {
+		return fmt.Sprintf("%s (%s) [%s]", d.Name, d.CurrentVersion, strings.Join(flags, " "))
+	}
 	return fmt.Sprintf("%s (%s)", d.Name, d.CurrentVersion)
 }
 func (d *Dylib) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		LoadCmd   string `json:"load_cmd"`
-		Len       uint32 `json:"length"`
-		Name      string `json:"name"`
-		Timestamp uint32 `json:"timestamp"`
-		Current   string `json:"current_version"`
-		Compat    string `json:"compatibility_version"`
+		LoadCmd   string   `json:"load_cmd"`
+		Len       uint32   `json:"length"`
+		Name      string   `json:"name"`
+		Timestamp uint32   `json:"timestamp"`
+		Current   string   `json:"current_version"`
+		Compat    string   `json:"compatibility_version"`
+		Flags     []string `json:"flags,omitempty"`
 	}{
 		LoadCmd:   d.Command().String(),
 		Len:       d.Len,
@@ -2655,6 +2826,7 @@ func (d *Dylib) MarshalJSON() ([]byte, error) {
 		Timestamp: d.Timestamp,
 		Current:   d.CurrentVersion.String(),
 		Compat:    d.CompatVersion.String(),
+		Flags:     d.Flags.List(),
 	})
 }
 
